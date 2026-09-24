@@ -1,6 +1,6 @@
 # LineScope as a literate program.
 #   make check    tangle the web and verify it reproduces the project's sources exactly
-#   make pdf      weave the web and typeset build/linescope.pdf (needs tectonic)
+#   make pdf      weave the web and typeset linescope.pdf (needs tectonic; a copy is committed)
 #   make tangle   write the tangled sources to build/tangled/ without touching the project
 #   make clean
 
@@ -27,7 +27,10 @@ tangle:
 build/body.tex build/chunkindex.tex: $(WEB) lit.py
 	$(PYTHON) lit.py weave -o build $(WEB)
 
-pdf: build/linescope.pdf
+pdf: linescope.pdf
+
+linescope.pdf: build/linescope.pdf
+	cp build/linescope.pdf linescope.pdf
 
 build/linescope.pdf: linescope.tex build/body.tex build/chunkindex.tex
 	$(TECTONIC) --keep-logs --outdir build linescope.tex

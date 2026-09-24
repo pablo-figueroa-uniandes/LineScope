@@ -14,7 +14,7 @@ Makefile        make check | make pdf | make tangle | make clean
 | Command | What it does |
 |---|---|
 | `make check` | Tangles every root chunk and compares it byte for byte with the file of the same path in the repository. It also fails if a project source file isn't produced by any root chunk. |
-| `make pdf` | Weaves the web and typesets `build/linescope.pdf` with [tectonic](https://tectonic-typesetting.github.io). |
+| `make pdf` | Weaves the web, typesets it with [tectonic](https://tectonic-typesetting.github.io), and copies the result to the committed `linescope.pdf`. |
 | `make tangle` | Writes the tangled sources to `build/tangled/` without touching the project. |
 
 Tectonic downloads the LaTeX packages it needs on the first run. Code is set in Menlo, which ships with macOS.

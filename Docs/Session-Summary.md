@@ -18,6 +18,8 @@
 | 6 | A `LiterateP` directory for producing a PDF describing all the code as a Knuth-style literate program | A noweb-style web of 10 chapters and 250 chunks, the `lit.py` tangle/weave/check tool, a LaTeX driver and a Makefile. It produces a 102-page PDF and reproduces all 24 source files byte for byte |
 | 7 | A `Docs` directory with a document explaining the theory and the code | `Docs/LineScope-Theory-and-Code.md`, with 4 generated SVG figures, 2 app screenshots, formulas, tables and line-level code links |
 | 8 | A summary of the session | This file |
+| 9 | Upload the project to GitHub | Public repository [pablo-figueroa-uniandes/LineScope](https://github.com/pablo-figueroa-uniandes/LineScope) |
+| 10 | A top-level README, the PDFs and the Xcode project, committed | `README.md`, `LiterateP/linescope.pdf`, `Docs/LineScope-Theory-and-Code.pdf` (from `Docs/tools/build_pdf.py`) and `LineScope.xcodeproj` |
 
 ## 2. Design decisions (confirmed with the user during planning)
 
@@ -50,7 +52,7 @@ Decisions made during implementation:
   - **File:** New Test Pattern, Export Image (PNG), Close Tab.
   - **View:** split/unsplit each zone, device pixels, reset line, show inspector.
 - **Inspector window (⌥⌘I):** file facts, focused copy size and scale, operation chain, line in pixels, channel statistics, peak frequency.
-- The Xcode project is generated with XcodeGen and isn't kept in the repository.
+- The Xcode project is generated with XcodeGen from `project.yml`. It is committed so the repository opens directly in Xcode.
 
 ### 3.2 The core library (`Packages/LineScopeCore/`)
 | File | Contents |
