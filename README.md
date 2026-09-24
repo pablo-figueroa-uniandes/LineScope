@@ -1,6 +1,6 @@
 # LineScope
 
-A native macOS tool for **seeing what resampling and filtering do to an image**. You derive copies of an image with different methods and draw one line across them. LineScope then shows, for every copy, side by side:
+A native macOS and Windows tool for **seeing what resampling and filtering do to an image**. You derive copies of an image with different methods and draw one line across them. LineScope then shows, for every copy, side by side:
 
 1. the image at its true pixel scale, with the line on it;
 2. one color channel sampled along the line (RGBA, HSL or CMYK);
@@ -36,6 +36,18 @@ Unit tests for the numeric core:
 cd Packages/LineScopeCore && swift test
 ```
 
+### Windows
+
+The Windows port lives in [`Windows/`](Windows/README.md). It is C# / .NET 9 / WPF, with the same features. It requires Windows 10 or 11 and the .NET 9 SDK.
+
+```sh
+cd Windows
+dotnet run --project LineScope.App        # or open LineScope.sln in Visual Studio
+dotnet test LineScope.Core.Tests
+```
+
+[Windows/README.md](Windows/README.md) explains how each macOS framework was replaced, and where the numbers can differ.
+
 ## Documentation
 
 | Document | What it is |
@@ -50,6 +62,7 @@ cd Packages/LineScopeCore && swift test
 LineScope/               SwiftUI app: document, session model, views, menus
 Packages/LineScopeCore/  numeric core (pixels, resampling, filters, sampling, color, FFT, patterns) and tests
 LineScope.xcodeproj      generated from project.yml
+Windows/                 Windows port: .NET solution with LineScope.Core, its xUnit tests, and the WPF app
 LiterateP/               literate program (noweb chapters, lit.py, LaTeX driver, PDF)
 Docs/                    theory document, figures, PDFs, session summary
 ```

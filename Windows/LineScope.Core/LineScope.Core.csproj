@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>LineScope.Core</RootNamespace>
+    <!-- Pixel loops are unusably slow unoptimized; optimize even in Debug (like the Swift package's -O). -->
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="LineScope.Core.Tests" />
+  </ItemGroup>
+
+</Project>

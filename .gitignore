@@ -6,3 +6,10 @@ DerivedData/
 xcuserdata/
 .swiftpm/
 LiterateP/build/
+
+# Windows port (.NET)
+Windows/**/bin/
+Windows/**/obj/
+Windows/publish/
+.vs/
+*.user
