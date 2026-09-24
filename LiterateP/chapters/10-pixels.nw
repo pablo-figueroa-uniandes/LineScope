@@ -1,0 +1,260 @@
+\chapter{Pixels}\label{ch:pixels}
+
+Every numeric part of LineScope works on one image representation, the [[PixelBuffer]]. Choosing
+it well settles a surprising number of later questions, so this chapter is short on code but long on
+decisions.
+
+\section{The representation}
+
+A buffer stores its pixels \emph{interleaved}: the four components of a pixel sit next to each
+other, and pixels follow one another row by row, starting with the \emph{top} row. The component
+of channel $c \in \{0,1,2,3\}$ (red, green, blue, alpha) at column $x$ and row $y$ of a buffer
+of width $W$ therefore lives at index
+\[
+  4\,(yW + x) + c .
+\]
+Row 0 at the top matches the way images are stored in files and drawn on the screen, so no
+flipping is ever needed between the buffer, Core Graphics bitmaps and the views.
+
+Components are 32-bit floats in $[0,1]$. Floats let a filter produce intermediate values
+(negative lobes of a Lanczos kernel, overshoot of a sharpening filter) without wrapping around,
+and they make the arithmetic in resampling exact enough that the tests can compare against
+closed-form answers.
+
+Two further conventions matter.
+
+\paragraph{Encoded, not linear.} The components are the sRGB-\emph{encoded} values, the numbers
+stored in the file and sent to the display, not the linear-light intensities obtained by undoing
+the sRGB transfer curve. A physically careful resampler would linearize first; LineScope
+deliberately does not, because its purpose is to show the profile of the values a user sees and
+that most software filters operate on. Everything downstream (profiles, spectra, filters) sees
+the same encoded numbers.
+
+\paragraph{Straight alpha.} Colors are stored with \emph{straight} (non-premultiplied) alpha, so
+a half-transparent red pixel is $(1, 0, 0, \tfrac12)$ rather than $(\tfrac12, 0, 0, \tfrac12)$.
+Straight alpha is what a user expects to read in a profile. Filtering, however, must be done on
+premultiplied values $(\alpha r, \alpha g, \alpha b, \alpha)$; otherwise a fully transparent
+pixel, whose color is arbitrary, would bleed its color into its neighbors. The buffer therefore
+offers conversions in both directions (Section~\ref{sec:premultiply}).
+
+The file has two parts: the types themselves, and the bridge to Core Graphics.
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift>>=
+import CoreGraphics
+import Foundation
+
+<<PixelBuffer: the color sample [[RGBA]]>>
+
+<<PixelBuffer: the buffer type>>
+
+// MARK: - Core Graphics bridging
+
+extension PixelBuffer {
+    <<PixelBuffer: the sRGB color space>>
+
+    <<PixelBuffer: decoding a [[CGImage]]>>
+
+    <<PixelBuffer: encoding a [[CGImage]]>>
+}
+@
+
+A single color sample is a small value type. It is what a line sampler returns and what the color
+conversions of Chapter~\ref{ch:analysis} consume. Alpha defaults to opaque, because most samples are.
+
+<<PixelBuffer: the color sample [[RGBA]]>>=
+/// A color sample with straight (non-premultiplied) alpha, sRGB-encoded components in 0...1.
+public struct RGBA: Sendable, Equatable {
+    public var r: Float
+    public var g: Float
+    public var b: Float
+    public var a: Float
+
+    public init(r: Float, g: Float, b: Float, a: Float = 1) {
+        self.r = r
+        self.g = g
+        self.b = b
+        self.a = a
+    }
+}
+@
+
+The buffer is a struct holding its dimensions and one flat array. Swift arrays are copy-on-write,
+so passing a buffer around (to a background task, into an [[ImageVariant]]) costs nothing until
+someone mutates it. The type is [[Sendable]], which lets it cross from the main actor to a detached
+task and back, and [[Equatable]], which the tests use to compare whole images.
+
+<<PixelBuffer: the buffer type>>=
+/// Interleaved RGBA Float32 image. Row 0 is the top row.
+/// Components are sRGB-encoded (not linearized) with straight alpha, so values match what is displayed.
+public struct PixelBuffer: Sendable, Equatable {
+    <<PixelBuffer: stored properties and initializers>>
+
+    <<PixelBuffer: pixel subscript>>
+
+    <<PixelBuffer: premultiplication>>
+}
+@
+
+\section{Construction and access}
+
+The designated initializer takes the raw array and checks the one invariant everything else relies
+on: exactly four floats per pixel, and at least one pixel. A buffer with zero width would make the
+resampler divide by zero, so it is rejected at the door. The second initializer fills the image with
+one color; the tests and the test-pattern generator start from it.
+
+<<PixelBuffer: stored properties and initializers>>=
+public let width: Int
+public let height: Int
+public var data: [Float]
+
+public init(width: Int, height: Int, data: [Float]) {
+    precondition(width > 0 && height > 0 && data.count == width * height * 4)
+    self.width = width
+    self.height = height
+    self.data = data
+}
+
+public init(width: Int, height: Int, fill: RGBA = RGBA(r: 0, g: 0, b: 0, a: 1)) {
+    var data = [Float](repeating: 0, count: width * height * 4)
+    for i in stride(from: 0, to: data.count, by: 4) {
+        data[i] = fill.r
+        data[i + 1] = fill.g
+        data[i + 2] = fill.b
+        data[i + 3] = fill.a
+    }
+    self.init(width: width, height: height, data: data)
+}
+@
+
+A subscript reads and writes whole pixels using the index formula above. It is convenient rather
+than fast: the heavy loops in resampling and filtering index [[data]] directly through unsafe buffer
+pointers instead.
+
+<<PixelBuffer: pixel subscript>>=
+public subscript(x: Int, y: Int) -> RGBA {
+    get {
+        let i = (y * width + x) * 4
+        return RGBA(r: data[i], g: data[i + 1], b: data[i + 2], a: data[i + 3])
+    }
+    set {
+        let i = (y * width + x) * 4
+        data[i] = newValue.r
+        data[i + 1] = newValue.g
+        data[i + 2] = newValue.b
+        data[i + 3] = newValue.a
+    }
+}
+@
+
+\section{Premultiplication}\label{sec:premultiply}
+
+To premultiply, scale the three color components of every pixel by its alpha. The result is a bare
+array, not a [[PixelBuffer]], on purpose: premultiplied data is an internal intermediate of the
+resampler and of the Core Image bridge, and giving it its own type would invite someone to plot it.
+
+Going back divides by alpha. Two safeguards make this robust against what filters produce. Alpha is
+first clamped to $[0,1]$, since a Lanczos kernel can overshoot it. Where alpha is (nearly) zero the
+color is undefined, and dividing would amplify rounding noise into bright garbage; such pixels
+become transparent black. The color components are clamped too, which is where the overshoot and
+undershoot of sharpening kernels is finally cut off.
+
+<<PixelBuffer: premultiplication>>=
+// MARK: Premultiplication (used by resampling and Core Image, which expect premultiplied data)
+
+func premultiplied() -> [Float] {
+    var out = data
+    for i in stride(from: 0, to: out.count, by: 4) {
+        let a = out[i + 3]
+        out[i] *= a
+        out[i + 1] *= a
+        out[i + 2] *= a
+    }
+    return out
+}
+
+static func fromPremultiplied(width: Int, height: Int, _ p: [Float]) -> PixelBuffer {
+    var out = p
+    for i in stride(from: 0, to: out.count, by: 4) {
+        let a = min(max(out[i + 3], 0), 1)
+        out[i + 3] = a
+        if a > 1e-6 {
+            out[i] = min(max(out[i] / a, 0), 1)
+            out[i + 1] = min(max(out[i + 1] / a, 0), 1)
+            out[i + 2] = min(max(out[i + 2] / a, 0), 1)
+        } else {
+            out[i] = 0
+            out[i + 1] = 0
+            out[i + 2] = 0
+        }
+    }
+    return PixelBuffer(width: width, height: height, data: out)
+}
+@
+
+\section{Bridging to Core Graphics}
+
+Images enter the program as [[CGImage]] values decoded by ImageIO, and they leave it as
+[[CGImage]] values drawn by SwiftUI or written to PNG. Both directions go through the sRGB color
+space, created once.
+
+<<PixelBuffer: the sRGB color space>>=
+static let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+@
+
+A decoded image can have any layout: 16 bits per component, CMYK, a grayscale palette, alpha first
+or last. Rather than handling each case, the decoder lets Core Graphics do the conversion: it
+creates an 8-bit premultiplied RGBA bitmap in sRGB and draws the image into it. Interpolation is
+switched off; the image is drawn at its own size, so no resampling should happen at all, and
+this makes sure of it. The bitmap's memory is borrowed from a Swift array for the duration of the
+closure, and the bytes are then scaled to $[0,1]$ and un-premultiplied.
+
+This does lose precision for 16-bit sources. The inspector reports the source's real bit depth, so
+the user knows when that happened.
+
+<<PixelBuffer: decoding a [[CGImage]]>>=
+/// Decodes any CGImage into 8-bit sRGB and converts it to a float buffer.
+public init?(cgImage: CGImage) {
+    let w = cgImage.width
+    let h = cgImage.height
+    guard w > 0, h > 0 else { return nil }
+    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+    let drawn = bytes.withUnsafeMutableBytes { raw -> Bool in
+        guard let ctx = CGContext(
+            data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: PixelBuffer.sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+        ctx.interpolationQuality = .none
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return true
+    }
+    guard drawn else { return nil }
+    var p = [Float](repeating: 0, count: w * h * 4)
+    for i in 0..<p.count { p[i] = Float(bytes[i]) / 255 }
+    self = PixelBuffer.fromPremultiplied(width: w, height: h, p)
+}
+@
+
+The opposite direction clamps, premultiplies and rounds each component to a byte, and wraps the
+bytes in a data provider. The image is marked [[shouldInterpolate: false]] so that when SwiftUI
+draws it, nothing smooths the pixels behind the program's back. Seeing the blocky result of
+nearest-neighbor upsampling is part of the point.
+
+<<PixelBuffer: encoding a [[CGImage]]>>=
+/// Renders the buffer as an 8-bit premultiplied sRGB CGImage for display or export.
+public func makeCGImage() -> CGImage? {
+    var bytes = [UInt8](repeating: 0, count: data.count)
+    for i in stride(from: 0, to: data.count, by: 4) {
+        let a = min(max(data[i + 3], 0), 1)
+        bytes[i] = UInt8((min(max(data[i], 0), 1) * a * 255).rounded())
+        bytes[i + 1] = UInt8((min(max(data[i + 1], 0), 1) * a * 255).rounded())
+        bytes[i + 2] = UInt8((min(max(data[i + 2], 0), 1) * a * 255).rounded())
+        bytes[i + 3] = UInt8((a * 255).rounded())
+    }
+    guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+    return CGImage(
+        width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+        space: PixelBuffer.sRGB, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+    )
+}
+@

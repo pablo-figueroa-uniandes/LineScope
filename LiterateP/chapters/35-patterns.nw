@@ -1,0 +1,326 @@
+\chapter{Test Patterns}\label{ch:patterns}
+
+Natural photographs make poor test inputs for a resampler. Their spectrum is unknown, so it's hard
+to tell whether a ripple in a profile comes from the image or from the filter. Synthetic patterns
+have known spectra, and each one stresses one property: a chirp sweeps all frequencies, an edge
+shows ringing, an impulse shows the point-spread function. LineScope can generate eleven such
+patterns. The generator lives in the core package, so the tests can use it too.
+
+\section{The catalog}
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/TestPattern.swift>>=
+import Foundation
+
+<<TestPattern: pattern kinds>>
+
+<<TestPattern: specification>>
+
+<<TestPattern: generator>>
+
+<<TestPattern: SplitMix64>>
+@ A kind is an enumeration case. It is [[Codable]] because a pattern window is restored after a
+relaunch from its specification alone (Chapter~\ref{ch:views}).
+
+<<TestPattern: pattern kinds>>=
+/// Synthetic images commonly used to evaluate resampling and filtering.
+public enum TestPatternKind: String, CaseIterable, Identifiable, Codable, Sendable {
+    <<TestPattern: the cases>>
+
+    public var id: String { rawValue }
+
+    <<TestPattern: display names>>
+
+    <<TestPattern: what each pattern is for>>
+
+    <<TestPattern: the tunable parameter>>
+}
+<<TestPattern: the cases>>=
+case zonePlate
+case linearChirp
+case sineGrating
+case squareGrating
+case checkerboard
+case stepEdge
+case slantedEdge
+case impulses
+case siemensStar
+case whiteNoise
+case hueRamp
+<<TestPattern: display names>>=
+public var displayName: String {
+    switch self {
+    case .zonePlate: "Zone Plate"
+    case .linearChirp: "Linear Chirp"
+    case .sineGrating: "Sine Grating"
+    case .squareGrating: "Square-Wave Bars"
+    case .checkerboard: "Checkerboard"
+    case .stepEdge: "Step Edge"
+    case .slantedEdge: "Slanted Edge"
+    case .impulses: "Impulse Grid"
+    case .siemensStar: "Siemens Star"
+    case .whiteNoise: "White Noise"
+    case .hueRamp: "Hue / Lightness Ramp"
+    }
+}
+@ The generator window shows one sentence about each pattern. These sentences are the short
+version of this chapter, and they say which filter behavior each pattern reveals.
+
+<<TestPattern: what each pattern is for>>=
+/// What the pattern is good for, shown in the generator window.
+public var purpose: String {
+    switch self {
+    case .zonePlate: "Circular chirp: frequency grows with radius up to the chosen maximum. Aliasing appears as false ring centers."
+    case .linearChirp: "Horizontal sweep from 0 to the chosen frequency. Put the line across it to read a filter's frequency response."
+    case .sineGrating: "Single pure frequency along x. The spectrum should show one peak."
+    case .squareGrating: "Bars with odd harmonics. Shows how filters treat harmonics near Nyquist."
+    case .checkerboard: "Two-dimensional square wave. Small cells alias badly under nearest-neighbor."
+    case .stepEdge: "One hard vertical edge. Reveals ringing (sinc, Lanczos) versus blur (tent, Mitchell)."
+    case .slantedEdge: "Edge tilted a few degrees, the standard target for measuring sharpness (MTF)."
+    case .impulses: "Isolated single pixels. Each dot shows the filter's point-spread function."
+    case .siemensStar: "Radial spokes: spatial frequency rises toward the center, in every orientation."
+    case .whiteNoise: "Uniform random values with a flat spectrum. The profile's spectrum shows the filter's transfer curve."
+    case .hueRamp: "Hue across x, lightness down y. Use it with the HSL and CMYK channels."
+    }
+}
+@ Every pattern has at most one parameter. Keeping it to one number keeps the user interface
+simple, and a specification stays a small value that is easy to compare and store. The
+parameter's name, default and range are given here, next to the patterns, so the generator window
+needs no knowledge of what the numbers mean.
+
+<<TestPattern: the tunable parameter>>=
+/// The single tunable parameter, or nil if the pattern has none.
+public var parameter: (name: String, defaultValue: Double, range: ClosedRange<Double>)? {
+    switch self {
+    case .zonePlate, .linearChirp: ("Max frequency (cycles/px)", 0.5, 0.01...1)
+    case .sineGrating: ("Frequency (cycles/px)", 0.1, 0.001...1)
+    case .squareGrating: ("Period (px)", 8, 2...512)
+    case .checkerboard: ("Cell size (px)", 8, 1...512)
+    case .slantedEdge: ("Angle (degrees)", 5, -45...45)
+    case .impulses: ("Spacing (px)", 32, 2...1024)
+    case .siemensStar: ("Spokes", 36, 4...360)
+    case .whiteNoise: ("Seed", 1, 0...1_000_000)
+    case .stepEdge, .hueRamp: nil
+    }
+}
+@ \section{Specifications}
+
+A specification is everything needed to generate a pattern: kind, size and parameter. Because it
+is [[Hashable]] and [[Codable]], it can identify a window directly (it is its own [[id]]), and
+SwiftUI can store it to restore that window. A missing parameter takes the kind's default.
+
+The title names the window. It shows the parameter only when it tells something: the seed of white
+noise is interesting only if it isn't the default.
+
+<<TestPattern: specification>>=
+public struct TestPatternSpec: Codable, Hashable, Identifiable, Sendable {
+    public var kind: TestPatternKind
+    public var width: Int
+    public var height: Int
+    public var parameter: Double
+
+    public var id: Self { self }
+
+    public init(kind: TestPatternKind, width: Int = 512, height: Int = 512, parameter: Double? = nil) {
+        self.kind = kind
+        self.width = width
+        self.height = height
+        self.parameter = parameter ?? kind.parameter?.defaultValue ?? 0
+    }
+
+    public var title: String {
+        var t = "\(kind.displayName) \(width)×\(height)"
+        if let p = kind.parameter, kind != .whiteNoise || parameter != p.defaultValue {
+            t += " (\(fmt(parameter)))"
+        }
+        return t
+    }
+}
+@ \section{The generator}
+
+Generation is one function: set up a canvas, then fill it according to the kind.
+
+<<TestPattern: generator>>=
+public enum TestPatternGenerator {
+    public static func make(_ spec: TestPatternSpec) -> PixelBuffer {
+        <<TestPattern: set up the canvas>>
+
+        <<TestPattern: gray-level helper>>
+
+        switch spec.kind {
+        <<TestPattern: chirps and gratings>>
+        <<TestPattern: edges and impulses>>
+        <<TestPattern: Siemens star>>
+        <<TestPattern: noise and color ramp>>
+        }
+        return buf
+    }
+}
+@ The center $(c_x,c_y)$ is the geometric center of the image, which for an even size lies on a
+pixel corner.
+
+<<TestPattern: set up the canvas>>=
+let w = max(1, spec.width)
+let h = max(1, spec.height)
+let p = spec.parameter
+var buf = PixelBuffer(width: w, height: h)
+let cx = Double(w) / 2
+let cy = Double(h) / 2
+@ Most patterns are gray levels given by a function $f(x,y)$. The helper evaluates it at pixel
+\emph{centers} $(x+\frac12, y+\frac12)$, the convention of the whole program. Evaluating at
+corners would shift every pattern by half a pixel against the line sampler. Point sampling like
+this is deliberate: no pattern is antialiased, so patterns with frequencies near or above the
+Nyquist limit already alias in the original. Those are exactly the cases that test a filter.
+
+<<TestPattern: gray-level helper>>=
+func gray(_ f: (Double, Double) -> Double) {
+    for y in 0..<h {
+        for x in 0..<w {
+            // Evaluate at pixel centers.
+            let v = Float(min(max(f(Double(x) + 0.5, Double(y) + 0.5), 0), 1))
+            buf[x, y] = RGBA(r: v, g: v, b: v)
+        }
+    }
+}
+@ \subsection{Chirps and gratings}
+
+A \emph{zone plate} is a circular chirp,
+\[
+  f(r) = \tfrac12 + \tfrac12\cos(\pi k r^2),
+\]
+where $r$ is the distance from the center. Its phase is $\phi(r)=\pi k r^2$, so its local
+frequency is $\frac{1}{2\pi}\,\frac{d\phi}{dr} = k r$ cycles per pixel, growing linearly with the
+radius. The constant $k$ is chosen so that the frequency reaches the parameter $p$ at
+$r = \max(w,h)/2$, the ends of the default horizontal line. Along that line a zone plate thus
+sweeps every frequency from $0$ to $p$ and back. When a copy can't represent the high end, the
+excess folds back and shows as false ring centers: the classic picture of aliasing.
+
+The \emph{linear chirp} is the one-dimensional version, a sweep across $x$ only. Its phase
+$\pi p x^2/W$ has instantaneous frequency $p\,x/W$, from $0$ at the left edge to $p$ at the
+right. Read along a horizontal line, its profile is the frequency response of the filter, with
+frequency on the horizontal axis.
+
+The \emph{sine grating} has a single frequency $p$, so its spectrum should show a single peak.
+The \emph{square-wave bars} contain the odd harmonics $1, 3, 5, \dots$ of $1/\text{period}$,
+with amplitudes falling as $1/n$. The \emph{checkerboard} is their two-dimensional product.
+
+<<TestPattern: chirps and gratings>>=
+case .zonePlate:
+    // Local frequency k·r reaches p at r = max(w,h)/2 (the left/right edges of the midline).
+    let k = p / (Double(max(w, h)) / 2)
+    gray { x, y in
+        let r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy)
+        return 0.5 + 0.5 * cos(Double.pi * k * r2)
+    }
+case .linearChirp:
+    // Phase 2π·p·x²/(2W): instantaneous frequency p·x/W.
+    gray { x, _ in 0.5 + 0.5 * cos(Double.pi * p * x * x / Double(w)) }
+case .sineGrating:
+    gray { x, _ in 0.5 + 0.5 * sin(2 * Double.pi * p * x) }
+case .squareGrating:
+    let period = max(p, 1)
+    gray { x, _ in (x - 0.5).truncatingRemainder(dividingBy: period) < period / 2 ? 1 : 0 }
+case .checkerboard:
+    let cell = max(Int(p.rounded()), 1)
+    gray { x, y in ((Int(x) / cell) + (Int(y) / cell)) % 2 == 0 ? 1 : 0 }
+@ \subsection{Edges and impulses}
+
+A \emph{step edge} is the input that separates the kernels most clearly. An interpolating
+kernel with negative lobes (Catmull-Rom, Lanczos, sinc) overshoots on both sides of the step and
+rings, and a truncated sinc rings the longest. A non-negative kernel (tent, area) only blurs, and
+Mitchell-Netravali sits in between~\cite{mitchell88}. The levels $0.1$ and $0.9$ leave room for
+overshoot to show instead of being clipped at $0$ and $1$.
+
+A \emph{slanted edge} is the same edge tilted by $\alpha$ degrees. Because the edge crosses the
+pixel grid at a slight angle, successive rows sample it at different sub-pixel phases, which is why
+it is the standard target for measuring sharpness. A pixel is on the bright side when
+$(x-c_x)\cos\alpha + (y-c_y)\sin\alpha \ge 0$.
+
+The \emph{impulse grid} puts single bright pixels on a black ground, far enough apart that
+their responses don't overlap. After a filter, each dot \emph{is} the kernel's two-dimensional
+point-spread function, sampled.
+
+<<TestPattern: edges and impulses>>=
+case .stepEdge:
+    gray { x, _ in x < cx ? 0.1 : 0.9 }
+case .slantedEdge:
+    // Dark/light halves split by a line through the center tilted from vertical.
+    let a = p * Double.pi / 180
+    gray { x, y in ((x - cx) * cos(a) + (y - cy) * sin(a)) < 0 ? 0.1 : 0.9 }
+case .impulses:
+    let s = max(Int(p.rounded()), 1)
+    let off = s / 2
+    gray { x, y in (Int(x) % s == off && Int(y) % s == off) ? 1 : 0 }
+@ \subsection{The Siemens star}
+
+A \emph{Siemens star} has $s$ bright and $s$ dark spokes, given by the sign of
+$\sin(s\,\theta)$. At radius $r$ the circumference $2\pi r$ holds $s$ periods, so the
+tangential frequency is $s/(2\pi r)$ cycles per pixel. It rises toward the center without limit,
+and it does so in every direction, which the one-dimensional patterns can't show. Outside the
+inscribed circle the image is mid-gray.
+
+<<TestPattern: Siemens star>>=
+case .siemensStar:
+    let spokes = max(p.rounded(), 2)
+    let radius = Double(min(w, h)) / 2
+    gray { x, y in
+        let dx = x - cx, dy = y - cy
+        guard dx * dx + dy * dy <= radius * radius else { return 0.5 }
+        let theta = atan2(dy, dx)
+        return sin(spokes * theta) >= 0 ? 1 : 0
+    }
+@ \subsection{Noise and color}
+
+\emph{White noise} has, on average, a flat spectrum. After filtering, the spectrum of a profile
+is therefore the filter's transfer function times a constant, up to random fluctuations. The
+values must be reproducible, so that a restored window shows the same noise. So they come from a
+seeded generator rather than the system's random source. The top $53$ bits of each $64$-bit
+output divided by $2^{53}$ give a uniform double in $[0,1)$, with every representable value
+equally likely.
+
+The \emph{hue/lightness ramp} is the only colored pattern. Hue runs across $x$ at full
+saturation, and lightness falls from $1$ at the top to $0$ at the bottom. It is meant for the
+HSL and CMYK channels of the profile. The conversion can land a rounding error outside $[0,1]$,
+so every component is clamped.
+
+<<TestPattern: noise and color ramp>>=
+case .whiteNoise:
+    var rng = SplitMix64(seed: UInt64(max(p, 0)))
+    for y in 0..<h {
+        for x in 0..<w {
+            let v = Float(Double(rng.next() >> 11) / Double(1 << 53))
+            buf[x, y] = RGBA(r: v, g: v, b: v)
+        }
+    }
+case .hueRamp:
+    for y in 0..<h {
+        for x in 0..<w {
+            let hue = Float((Double(x) + 0.5) / Double(w) * 360)
+            let light = Float(1 - (Double(y) + 0.5) / Double(h))
+            let c = ColorConversion.rgb(h: min(hue, 359.999), s: 1, l: light)
+            buf[x, y] = RGBA(r: min(max(c.r, 0), 1), g: min(max(c.g, 0), 1), b: min(max(c.b, 0), 1))
+        }
+    }
+@ \section{SplitMix64}
+
+SplitMix64 is a tiny, fast generator with good statistical quality for a problem like this. Its
+state advances by a fixed odd constant (the ``golden gamma'' $\lfloor 2^{64}/\varphi\rfloor$),
+and each state is scrambled by two xor-shift-multiply rounds. The wrapping operators [[&+=]] and
+[[&*]] give the arithmetic modulo $2^{64}$ that the algorithm needs; the ordinary operators
+would trap on overflow.
+
+<<TestPattern: SplitMix64>>=
+/// Small deterministic generator so noise patterns are reproducible from their seed.
+struct SplitMix64 {
+    private var state: UInt64
+
+    init(seed: UInt64) { state = seed }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+@

@@ -1,0 +1,156 @@
+\chapter{Menus}\label{ch:commands}
+
+Everything the user can do to an image goes through the menu bar: derive a copy with a filter or
+a resampler, create a test pattern, split a zone, export, and open the inspector. SwiftUI
+describes menus with a [[Commands]] value, attached to the app's scenes in [[LineScopeApp]]
+(Chapter~\ref{ch:model}).
+
+<<LineScope/Commands/LineScopeCommands.swift>>=
+import LineScopeCore
+import SwiftUI
+
+struct LineScopeCommands: Commands {
+    <<Commands: finding the target session>>
+
+    var body: some Commands {
+        <<Commands: File menu, test patterns>>
+
+        <<Commands: File menu, export and close>>
+
+        <<Commands: Filter menu>>
+
+        <<Commands: Resample menu>>
+
+        <<Commands: View menu>>
+    }
+}
+@ \section{Which document does a menu act on?}
+
+Menus are global, but their actions are for one document: the one in the frontmost window.
+SwiftUI's way to connect the two is a \emph{focused value}. Each document window publishes its
+[[Session]] with [[focusedSceneValue]], and [[@FocusedValue]] here reads the value of whichever
+window is key.
+
+That alone has one bad consequence. The inspector is a separate window, and while the user works
+in it, \emph{it} is the key window. It publishes no session, so the focused value is [[nil]], and
+every menu item would turn gray at the moment the inspector is showing the image one wants to
+filter. So the menus fall back to [[ActiveSession.shared]], the session of the most recently key
+document window, which the document windows keep up to date (Chapter~\ref{ch:views}). When a
+document window is key, the two agree. When the inspector is key, the fallback names the document
+it describes.
+
+<<Commands: finding the target session>>=
+@FocusedValue(\.session) private var focusedSession
+@Environment(\.openWindow) private var openWindow
+
+/// Falls back to the last active document so the menus keep working while the inspector is key.
+private var session: Session? { focusedSession ?? ActiveSession.shared.session }
+@ Every action below starts with [[session?.]]. With no document open, the optional chain makes an
+action do nothing, and a [[.disabled(session == nil)]] makes that visible.
+
+\section{The File menu}
+
+Test patterns don't need a document: choosing one opens a new window for it. The value passed
+to [[openWindow(value:)]] is the pattern's specification with default size and parameter.
+SwiftUI finds the [[WindowGroup]] that presents that type (Chapter~\ref{ch:views}). The
+[[Custom…]] item opens the generator window, where size and parameter can be set first.
+
+<<Commands: File menu, test patterns>>=
+CommandGroup(after: .newItem) {
+    Menu("New Test Pattern") {
+        ForEach(TestPatternKind.allCases) { kind in
+            Button(kind.displayName) { openWindow(value: TestPatternSpec(kind: kind)) }
+        }
+        Divider()
+        Button("Custom…") { openWindow(id: TestPatternGeneratorView.windowID) }
+            .keyboardShortcut("n", modifiers: [.command, .option])
+    }
+}
+@ Export and Close Tab both act on the \emph{focused variant}: the tab last selected or clicked
+in any zone. The original can't be closed, because every other variant is derived from it and
+every pane falls back to it.
+
+<<Commands: File menu, export and close>>=
+CommandGroup(after: .saveItem) {
+    Button("Export Image…") { session?.exportFocused() }
+        .keyboardShortcut("e", modifiers: [.command, .shift])
+        .disabled(session == nil)
+    Button("Close Tab") {
+        if let session { session.closeVariant(session.focusedVariantID) }
+    }
+    .keyboardShortcut(.delete, modifiers: [.command])
+    .disabled(session?.focusedVariant.isOriginal ?? true)
+}
+@ \section{Filters and resampling}
+
+A menu item either runs its operation at once or asks for parameters first. Items that need
+parameters end in an ellipsis, as the macOS convention asks. They set the session's
+[[pendingRequest]], and the document window reacts by presenting the parameter sheet. The menu
+never shows user interface itself. The others call [[perform]], which runs the operation in the
+background on the focused variant and adds the result as a new tab. Since the source is whichever
+tab is focused, operations chain naturally: blur a copy, then shrink the blurred copy.
+
+The filters are grouped as the people using them think of them: smoothing, then sharpening and
+edge detection, then point operations on the colors.
+
+<<Commands: Filter menu>>=
+CommandMenu("Filter") {
+    Group {
+        Button("Gaussian Blur…") { session?.pendingRequest = .gaussianBlur }
+        Button("Box Blur…") { session?.pendingRequest = .boxBlur }
+        Button("Median 3×3") { session?.perform(.filter(.median)) }
+        Button("Noise Reduction…") { session?.pendingRequest = .noiseReduction }
+        Divider()
+        Button("Sharpen (Unsharp Mask)…") { session?.pendingRequest = .unsharpMask }
+        Button("Edge Detect (Sobel)") { session?.perform(.filter(.sobel)) }
+        Button("Laplacian") { session?.perform(.filter(.laplacian)) }
+        Button("Emboss") { session?.perform(.filter(.emboss)) }
+        Divider()
+        Button("Grayscale") { session?.perform(.filter(.grayscale)) }
+        Button("Invert") { session?.perform(.filter(.invert)) }
+    }
+    .disabled(session == nil)
+}
+@ The Resample menu is generated from [[ResampleMethod.allCases]]. A method added to that
+enumeration therefore appears in the menu without any change here. Every method needs a scale
+factor, so every item opens the sheet.
+
+<<Commands: Resample menu>>=
+CommandMenu("Resample") {
+    ForEach(ResampleMethod.allCases) { method in
+        Button("\(method.displayName)…") { session?.pendingRequest = .resample(method) }
+    }
+    .disabled(session == nil)
+}
+@ \section{The View menu}
+
+The View menu repeats the split and unsplit buttons of the zone headers, so they have menu
+items for keyboard users. It also holds the display option ``Actual Device Pixels''. That option
+lives in the session, so the menu adapts it with a [[Binding]] whose getter and setter go through
+the optional session. The inspector gets the shortcut Command-Option-I,
+which is conventional for inspectors on macOS.
+
+<<Commands: View menu>>=
+CommandGroup(before: .toolbar) {
+    ForEach(Zone.allCases) { zone in
+        Button("Split \(zone.title)") { session?.split(zone) }
+            .disabled(session == nil)
+    }
+    ForEach(Zone.allCases) { zone in
+        Button("Unsplit \(zone.title)") { session?.unsplit(zone) }
+            .disabled((session?.panes[zone.rawValue].count ?? 1) < 2)
+    }
+    Divider()
+    Toggle("Actual Device Pixels", isOn: Binding(
+        get: { session?.useDevicePixels ?? false },
+        set: { session?.useDevicePixels = $0 }
+    ))
+    .disabled(session == nil)
+    Button("Reset Line") { session?.line = .initial }
+        .disabled(session == nil)
+    Divider()
+    Button("Show Inspector") { openWindow(id: InspectorView.windowID) }
+        .keyboardShortcut("i", modifiers: [.command, .option])
+    Divider()
+}
+@

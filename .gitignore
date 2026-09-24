@@ -1,0 +1,9 @@
+build/
+.build/
+Packages/LineScopeCore/.build/
+LineScope.xcodeproj/
+DerivedData/
+.DS_Store
+xcuserdata/
+.swiftpm/
+LiterateP/build/

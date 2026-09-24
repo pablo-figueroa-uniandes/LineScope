@@ -1,0 +1,376 @@
+\chapter{Filters and Operations}\label{ch:filters}
+
+Filters keep the size of an image and change its content. LineScope offers the handful that people
+most often want to compare: blurs, a median, sharpening, noise reduction, edge detectors, and two
+per-pixel color maps. Where Core Image already has a good, well-known implementation it is used;
+where a filter is simple enough to state in a few lines (the $3\times3$ kernels), it is written out, so
+the reader can see precisely what was computed.
+
+The second half of the chapter introduces [[ImageOperation]], the value that describes \emph{one
+step} from one image to the next, whether that step is a filter or a resampling.
+
+\section{The filters}
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/Filters.swift>>=
+import CoreImage
+import CoreImage.CIFilterBuiltins
+import Foundation
+
+<<Filters: the [[FilterKind]] enumeration>>
+
+<<Filters: number formatting for names>>
+
+public enum Filters {
+    <<Filters: dispatching a filter>>
+
+    // MARK: - Core Image
+
+    <<Filters: the Core Image context>>
+
+    <<Filters: running a Core Image filter on a buffer>>
+
+    // MARK: - CPU filters
+
+    <<Filters: per-pixel color maps>>
+
+    <<Filters: [[3x3]] convolution>>
+
+    <<Filters: Sobel gradient magnitude>>
+}
+@
+
+A filter is described by an enumeration whose cases carry their parameters. Because the value is
+[[Equatable]] and [[Sendable]], it can be stored in an image's history and shipped to a
+background task. Its [[displayName]] becomes part of a tab title, so it names the parameters
+compactly: ``Gaussian r=2'' tells the user what was applied.
+
+<<Filters: the [[FilterKind]] enumeration>>=
+public enum FilterKind: Sendable, Equatable {
+    case gaussianBlur(radius: Double)
+    case boxBlur(radius: Double)
+    case median
+    case unsharpMask(radius: Double, intensity: Double)
+    case noiseReduction(level: Double, sharpness: Double)
+    case sobel
+    case laplacian
+    case emboss
+    case grayscale
+    case invert
+
+    public var displayName: String {
+        switch self {
+        case .gaussianBlur(let r): "Gaussian r=\(fmt(r))"
+        case .boxBlur(let r): "Box r=\(fmt(r))"
+        case .median: "Median 3×3"
+        case .unsharpMask(let r, let i): "Sharpen r=\(fmt(r)) i=\(fmt(i))"
+        case .noiseReduction(let l, let s): "Denoise \(fmt(l))/\(fmt(s))"
+        case .sobel: "Sobel"
+        case .laplacian: "Laplacian"
+        case .emboss: "Emboss"
+        case .grayscale: "Grayscale"
+        case .invert: "Invert"
+        }
+    }
+}
+@
+
+Parameters are shown with at most three decimals and no trailing zeros, so $2$ reads ``2'' and
+$0.125$ reads ``0.125''. The helper is internal to the package; the resampling and test-pattern names
+use it too.
+
+<<Filters: number formatting for names>>=
+func fmt(_ v: Double) -> String {
+    v.formatted(.number.precision(.fractionLength(0...3)))
+}
+@
+
+\subsection{Dispatch}
+
+[[Filters.apply]] maps each case to its implementation. The first group goes to Core Image, each
+case building one built-in filter with its parameters.
+
+<<Filters: dispatching a filter>>=
+public static func apply(_ filter: FilterKind, to src: PixelBuffer) -> PixelBuffer {
+    switch filter {
+    <<Filters: Core Image cases>>
+    <<Filters: CPU cases>>
+    }
+}
+@
+
+The Gaussian blur's radius is Core Image's, roughly the standard deviation $\sigma$ in pixels. The box
+blur averages over a square of that radius. The median is Core Image's fixed $3\times3$ median, good
+at removing isolated outliers without softening edges. The unsharp mask adds back
+$\mathit{intensity}\times(\text{image} - \text{blurred image})$, which boosts high frequencies and is
+visible in the spectrum as a lift just below Nyquist. Noise reduction is Core Image's adaptive
+smoothing, which leaves edges above a sharpness threshold alone.
+
+<<Filters: Core Image cases>>=
+case .gaussianBlur(let radius):
+    return applyCI(src) { img in
+        let f = CIFilter.gaussianBlur()
+        f.inputImage = img
+        f.radius = Float(radius)
+        return f.outputImage
+    }
+case .boxBlur(let radius):
+    return applyCI(src) { img in
+        let f = CIFilter.boxBlur()
+        f.inputImage = img
+        f.radius = Float(radius)
+        return f.outputImage
+    }
+case .median:
+    return applyCI(src) { img in
+        let f = CIFilter.median()
+        f.inputImage = img
+        return f.outputImage
+    }
+case .unsharpMask(let radius, let intensity):
+    return applyCI(src) { img in
+        let f = CIFilter.unsharpMask()
+        f.inputImage = img
+        f.radius = Float(radius)
+        f.intensity = Float(intensity)
+        return f.outputImage
+    }
+case .noiseReduction(let level, let sharpness):
+    return applyCI(src) { img in
+        let f = CIFilter.noiseReduction()
+        f.inputImage = img
+        f.noiseLevel = Float(level)
+        f.sharpness = Float(sharpness)
+        return f.outputImage
+    }
+@
+
+The second group runs on the CPU. The Laplacian
+\[
+  \nabla^2 \approx \begin{pmatrix} 0 & 1 & 0\\ 1 & -4 & 1\\ 0 & 1 & 0 \end{pmatrix}
+\]
+responds with both signs around an edge and zero on flat regions, so its absolute value is shown;
+otherwise half of every edge would be clipped to black. The emboss kernel's weights sum to 1, so flat
+regions keep their color and edges become a relief lit from the top left. Grayscale uses the
+Rec.~709 luma weights on the encoded values, $Y = 0.2126R + 0.7152G + 0.0722B$, and inversion
+replaces every component $v$ with $1 - v$; both leave alpha alone.
+
+<<Filters: CPU cases>>=
+case .sobel:
+    return sobel(src)
+case .laplacian:
+    // Absolute response so the edges are visible.
+    return convolve3x3(src, kernel: [0, 1, 0, 1, -4, 1, 0, 1, 0], absolute: true)
+case .emboss:
+    return convolve3x3(src, kernel: [-2, -1, 0, -1, 1, 1, 0, 1, 2], absolute: false)
+case .grayscale:
+    return mapRGB(src) { c in
+        let y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+        return RGBA(r: y, g: y, b: y, a: c.a)
+    }
+case .invert:
+    return mapRGB(src) { c in RGBA(r: 1 - c.r, g: 1 - c.g, b: 1 - c.b, a: c.a) }
+@
+
+\subsection{The Core Image bridge}
+
+By default Core Image color-manages everything: it converts inputs to a linear working space,
+filters there, and converts back. That is usually right, but here it would make the Core Image
+filters disagree with the CPU filters and with the resampler, which all work on encoded values
+(Chapter~\ref{ch:pixels}). The context is therefore created with color management switched off
+for both the working and the output space. Intermediate caching is off too, since every image is
+filtered once and then thrown away. A [[CIContext]] is expensive to create and safe to share
+between threads, so there is one for the whole program.
+
+<<Filters: the Core Image context>>=
+/// Works directly on encoded values (no color management) so results are consistent with the CPU filters.
+private static let context = CIContext(options: [
+    .workingColorSpace: NSNull(),
+    .outputColorSpace: NSNull(),
+    .cacheIntermediates: false,
+])
+@
+
+Running a filter means wrapping the premultiplied floats as a [[CIImage]] in the [[RGBAf]] format
+(four 32-bit floats per pixel, hence 16 bytes per pixel in a row) with no color space, which again
+means ``don't convert''. Two details keep the image the same size and free of dark borders.
+First, the input is \emph{clamped to its extent}, which extends the border pixels to infinity, so a
+blur near the edge averages real edge colors instead of transparent black. Second, the output is
+cropped back to the original rectangle, since a blur's output would otherwise grow by its radius.
+The rendered floats are then converted back to straight alpha.
+
+If a filter can't be built, the source is returned unchanged rather than failing the operation.
+
+<<Filters: running a Core Image filter on a buffer>>=
+private static func applyCI(_ src: PixelBuffer, _ build: (CIImage) -> CIImage?) -> PixelBuffer {
+    let w = src.width
+    let h = src.height
+    let premul = src.premultiplied()
+    let data = premul.withUnsafeBytes { Data($0) }
+    let input = CIImage(
+        bitmapData: data, bytesPerRow: w * 16, size: CGSize(width: w, height: h),
+        format: .RGBAf, colorSpace: nil
+    )
+    let extent = input.extent
+    guard let output = build(input.clampedToExtent())?.cropped(to: extent) else { return src }
+    var result = [Float](repeating: 0, count: w * h * 4)
+    result.withUnsafeMutableBytes { raw in
+        context.render(
+            output, toBitmap: raw.baseAddress!, rowBytes: w * 16, bounds: extent,
+            format: .RGBAf, colorSpace: nil
+        )
+    }
+    return PixelBuffer.fromPremultiplied(width: w, height: h, result)
+}
+@
+
+\subsection{CPU filters}
+
+A color map applies a function to every pixel independently.
+
+<<Filters: per-pixel color maps>>=
+private static func mapRGB(_ src: PixelBuffer, _ f: (RGBA) -> RGBA) -> PixelBuffer {
+    var out = src
+    for y in 0..<src.height {
+        for x in 0..<src.width {
+            out[x, y] = f(src[x, y])
+        }
+    }
+    return out
+}
+@
+
+The $3\times3$ convolution computes, for each color channel,
+\[
+  \mathrm{out}(x,y) = \sum_{k_y=-1}^{1}\sum_{k_x=-1}^{1} K(k_x,k_y)\;
+                      \mathrm{in}\bigl(\operatorname{clamp}(x+k_x),\ \operatorname{clamp}(y+k_y)\bigr),
+\]
+where clamping the coordinates repeats the border pixels, the same edge rule as the Core Image
+path. The kernel is given row by row. Results are clamped to $[0,1]$, optionally after taking
+the absolute value, and alpha is copied through unchanged. Since these kernels are applied to
+straight colors, not premultiplied ones, they are meant for opaque images, which is what they are
+used on.
+
+<<Filters: [[3x3]] convolution>>=
+/// 3×3 convolution on RGB with clamped edges; alpha is preserved.
+static func convolve3x3(_ src: PixelBuffer, kernel k: [Float], absolute: Bool) -> PixelBuffer {
+    var out = src
+    let w = src.width
+    let h = src.height
+    src.data.withUnsafeBufferPointer { s in
+        out.data.withUnsafeMutableBufferPointer { o in
+            for y in 0..<h {
+                for x in 0..<w {
+                    var acc: (Float, Float, Float) = (0, 0, 0)
+                    for ky in -1...1 {
+                        let yy = min(max(y + ky, 0), h - 1)
+                        for kx in -1...1 {
+                            let xx = min(max(x + kx, 0), w - 1)
+                            let wgt = k[(ky + 1) * 3 + (kx + 1)]
+                            let i = (yy * w + xx) * 4
+                            acc.0 += s[i] * wgt
+                            acc.1 += s[i + 1] * wgt
+                            acc.2 += s[i + 2] * wgt
+                        }
+                    }
+                    if absolute { acc = (abs(acc.0), abs(acc.1), abs(acc.2)) }
+                    let i = (y * w + x) * 4
+                    o[i] = min(max(acc.0, 0), 1)
+                    o[i + 1] = min(max(acc.1, 0), 1)
+                    o[i + 2] = min(max(acc.2, 0), 1)
+                }
+            }
+        }
+    }
+    return out
+}
+@
+
+The Sobel operator estimates the two components of the gradient with the kernels
+\[
+  G_x = \begin{pmatrix} -1 & 0 & 1\\ -2 & 0 & 2\\ -1 & 0 & 1 \end{pmatrix}, \qquad
+  G_y = G_x^{\mathsf T},
+\]
+each a derivative in one direction combined with a small smoothing in the other. The output is the
+gradient magnitude $\sqrt{s_x^2 + s_y^2}$, per channel and clamped to 1. Both sums are accumulated in
+the same pass over the neighborhood, so this can't be written as two calls to the general
+convolution without reading every pixel twice.
+
+<<Filters: Sobel gradient magnitude>>=
+/// Per-channel Sobel gradient magnitude.
+static func sobel(_ src: PixelBuffer) -> PixelBuffer {
+    let gx: [Float] = [-1, 0, 1, -2, 0, 2, -1, 0, 1]
+    let gy: [Float] = [-1, -2, -1, 0, 0, 0, 1, 2, 1]
+    var out = src
+    let w = src.width
+    let h = src.height
+    src.data.withUnsafeBufferPointer { s in
+        out.data.withUnsafeMutableBufferPointer { o in
+            for y in 0..<h {
+                for x in 0..<w {
+                    var sx: (Float, Float, Float) = (0, 0, 0)
+                    var sy: (Float, Float, Float) = (0, 0, 0)
+                    for ky in -1...1 {
+                        let yy = min(max(y + ky, 0), h - 1)
+                        for kx in -1...1 {
+                            let xx = min(max(x + kx, 0), w - 1)
+                            let ki = (ky + 1) * 3 + (kx + 1)
+                            let i = (yy * w + xx) * 4
+                            sx.0 += s[i] * gx[ki]; sy.0 += s[i] * gy[ki]
+                            sx.1 += s[i + 1] * gx[ki]; sy.1 += s[i + 1] * gy[ki]
+                            sx.2 += s[i + 2] * gx[ki]; sy.2 += s[i + 2] * gy[ki]
+                        }
+                    }
+                    let i = (y * w + x) * 4
+                    o[i] = min((sx.0 * sx.0 + sy.0 * sy.0).squareRoot(), 1)
+                    o[i + 1] = min((sx.1 * sx.1 + sy.1 * sy.1).squareRoot(), 1)
+                    o[i + 2] = min((sx.2 * sx.2 + sy.2 * sy.2).squareRoot(), 1)
+                }
+            }
+        }
+    }
+    return out
+}
+@
+
+\section{Operations}\label{sec:operations}
+
+The app never calls the filters or the resampler directly. It works with [[ImageOperation]]
+values, which unify the two kinds of step behind one name and one [[apply]] function. That gives the
+session model a single thing to run in the background, and a single thing to record. A derived
+image stores the list of operations that produced it from the original, its \emph{lineage}, and
+the inspector prints that list.
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/ImageOperation.swift>>=
+import Foundation
+
+/// One step that derives a new image from an existing one.
+public enum ImageOperation: Sendable, Equatable {
+    case filter(FilterKind)
+    case resample(ResampleMethod, scale: Double)
+
+    <<ImageOperation: display name>>
+
+    <<ImageOperation: applying the step>>
+}
+@
+
+<<ImageOperation: display name>>=
+public var displayName: String {
+    switch self {
+    case .filter(let f): f.displayName
+    case .resample(let m, let s): "\(m.shortName) ×\(fmt(s))"
+    }
+}
+@
+
+Applying an operation is a pure function from buffer to buffer. It touches no shared state, which is
+what makes it safe to run on a detached task.
+
+<<ImageOperation: applying the step>>=
+public func apply(to buffer: PixelBuffer) -> PixelBuffer {
+    switch self {
+    case .filter(let f): Filters.apply(f, to: buffer)
+    case .resample(let m, let s): Resampler.resample(buffer, scale: s, method: m)
+    }
+}
+@

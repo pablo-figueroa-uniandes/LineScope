@@ -1,0 +1,109 @@
+% Driver for the woven LineScope literate program. Build with `make pdf`.
+\documentclass[11pt,a4paper,openany]{book}
+
+\usepackage{fontspec}
+\setmonofont{Menlo}[Scale=MatchLowercase]
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{microtype}
+\setlength{\emergencystretch}{3em}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{needspace}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{nwkeyword}{HTML}{7A1F5C}
+\definecolor{nwcomment}{HTML}{5E6B5E}
+\definecolor{nwstring}{HTML}{8A4B0F}
+\definecolor{nwrule}{HTML}{B8B8B8}
+
+% ---------------------------------------------------------------- Swift for listings
+\lstdefinelanguage{Swift}{
+  morekeywords={
+    associatedtype,class,deinit,enum,extension,fileprivate,func,import,init,inout,internal,let,open,
+    operator,private,protocol,public,rethrows,static,struct,subscript,typealias,var,break,case,
+    continue,default,defer,do,else,fallthrough,for,guard,if,in,repeat,return,switch,where,while,as,
+    catch,false,is,nil,self,Self,super,throw,throws,true,try,await,async,final,lazy,mutating,
+    nonmutating,override,some,any,weak,get,set,didSet,willSet,nonisolated
+  },
+  morekeywords=[2]{@main,@Observable,@MainActor,@State,@Bindable,@Environment,@FocusedValue,
+    @Entry,@ViewBuilder,@testable,@escaping},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+\lstdefinestyle{nw}{
+  language=Swift,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{nwkeyword}\bfseries,
+  keywordstyle=[2]\color{nwkeyword},
+  commentstyle=\color{nwcomment}\itshape,
+  stringstyle=\color{nwstring},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  extendedchars=true,
+  upquote=true,
+  tabsize=4,
+  breaklines=true,
+  breakatwhitespace=true,
+  postbreak=\mbox{\textcolor{nwrule}{$\hookrightarrow$}\space},
+  escapeinside={(*@}{@*)},
+  literate={-}{{-}}1,
+  aboveskip=2pt,
+  belowskip=2pt,
+  xleftmargin=1.2em,
+}
+\lstnewenvironment{nwlisting}[1][]{\lstset{style=nw,#1}}{}
+\lstset{style=nw}
+
+% ---------------------------------------------------------------- noweb-style chunk markup
+% \nwbegin{number}{name}{first definition}{+ if continuation}
+\newcommand{\nwchunkname}[2]{$\langle$\textit{#2}\ \hyperref[nw:#1]{\textsf{\small #1}}$\rangle$}
+\newcommand{\nwbegin}[4]{%
+  \par\needspace{5\baselineskip}\medskip\noindent
+  \phantomsection\label{nw:#1}%
+  \makebox[2.2em][l]{\textsf{\bfseries\small #1}}%
+  \nwchunkname{#3}{#2}\,$\ifx&#4&\equiv\else\mathrel{+}\equiv\fi$\par\nobreak}
+\newcommand{\nwend}[1]{\par\nobreak\noindent\hspace*{2.2em}{\footnotesize\itshape\color{nwcomment}#1}\par\medskip}
+\newcommand{\nwref}[2]{\textrm{\normalsize\nwchunkname{#1}{#2}}}
+\newcommand{\nwlink}[1]{\hyperref[nw:#1]{#1}}
+\newcommand{\nwcode}[1]{\texttt{\small #1}}
+\newenvironment{nwindex}{\begin{description}[style=nextline,font=\normalfont,itemsep=1pt]}{\end{description}}
+\newcommand{\nwindexentry}[4]{\item[\nwchunkname{#2}{#1}] \small Defined in #3. Used in #4.}
+
+% ---------------------------------------------------------------- document
+\title{\Huge LineScope\\[0.6em]\Large A Literate Program for Studying\\Resampling and Filtering of Images}
+\author{\texttt{pfiguero@uniandes.edu.co}}
+\date{\today}
+
+\begin{document}
+\frontmatter
+\maketitle
+\tableofcontents
+\mainmatter
+\input{build/body.tex}
+\backmatter
+\cleardoublepage\phantomsection
+\addcontentsline{toc}{chapter}{\bibname}
+\begin{thebibliography}{9}
+\bibitem{knuth84} Donald E. Knuth. Literate Programming. \emph{The Computer Journal} 27(2):97--111, 1984.
+\bibitem{ramsey94} Norman Ramsey. Literate Programming Simplified. \emph{IEEE Software} 11(5):97--105, 1994.
+\bibitem{mitchell88} Don P. Mitchell and Arun N. Netravali. Reconstruction Filters in Computer Graphics.
+  \emph{Computer Graphics (SIGGRAPH '88)} 22(4):221--228, 1988.
+\bibitem{keys81} Robert G. Keys. Cubic Convolution Interpolation for Digital Image Processing.
+  \emph{IEEE Transactions on Acoustics, Speech, and Signal Processing} 29(6):1153--1160, 1981.
+\bibitem{harris78} Fredric J. Harris. On the Use of Windows for Harmonic Analysis with the Discrete Fourier Transform.
+  \emph{Proceedings of the IEEE} 66(1):51--83, 1978.
+\bibitem{xcodegen} XcodeGen. \url{https://github.com/yonaskolb/XcodeGen}.
+\end{thebibliography}
+\chapter*{Index of Chunks}
+\addcontentsline{toc}{chapter}{Index of Chunks}
+\markboth{INDEX OF CHUNKS}{INDEX OF CHUNKS}
+Every chunk name, the chunks that define it, and the chunks that use it.
+Root chunks are tangled to the file named by the chunk.
+\input{build/chunkindex.tex}
+\end{document}

@@ -1,0 +1,733 @@
+\chapter{Documents and the Session Model}\label{ch:model}
+
+With the numeric core in place, we turn to the app. This chapter describes the data the user
+interface is built on: the scenes that make up the app, the document that brings an image in,
+the small value types that describe images, zones and panes, and the [[Session]], the one
+object per window that holds everything the views show.
+
+\section{The app and its scenes}
+
+A SwiftUI app is a list of \emph{scenes}, each a kind of window. LineScope has four.
+\begin{description}[style=nextline]
+\item[Image documents] One window per opened image file, supplied by [[DocumentGroup]] in its
+  \emph{viewing} form: the app opens documents but never creates or saves them, so there is no
+  New or Save command to disable.
+\item[Test patterns] One window per generated pattern (Chapter~\ref{ch:patterns}). A
+  [[WindowGroup]] keyed by a [[TestPatternSpec]] value opens a new window for each spec; because
+  the spec is [[Codable]], macOS can restore these windows after a relaunch.
+\item[Pattern generator] A single window for choosing a pattern and its parameters.
+\item[Inspector] A single window describing the image in focus, placed at the top right.
+\end{description}
+The menus of Chapter~\ref{ch:commands} are attached to the document scene, which puts them in the
+app's menu bar.
+
+<<LineScope/LineScopeApp.swift>>=
+import LineScopeCore
+import SwiftUI
+
+@main
+struct LineScopeApp: App {
+    var body: some Scene {
+        <<LineScopeApp: document windows>>
+
+        <<LineScopeApp: test-pattern windows>>
+
+        <<LineScopeApp: pattern generator window>>
+
+        <<LineScopeApp: inspector window>>
+    }
+}
+@
+
+A document window gets the document and a name to show and export under. The file name falls back
+to ``Untitled'' for documents without a URL.
+
+<<LineScopeApp: document windows>>=
+DocumentGroup(viewing: ImageDocument.self) { file in
+    MainView(document: file.document, fileName: file.fileURL?.lastPathComponent ?? "Untitled")
+}
+.defaultSize(width: 1100, height: 900)
+.commands { LineScopeCommands() }
+@
+
+The window group passes a binding to an optional spec, which is [[nil]] only in the moment before
+SwiftUI has decoded a restored window's value; nothing is shown then.
+
+<<LineScopeApp: test-pattern windows>>=
+WindowGroup("Test Pattern", for: TestPatternSpec.self) { $spec in
+    if let spec {
+        PatternWindow(spec: spec)
+    }
+}
+.defaultSize(width: 1100, height: 900)
+@
+
+<<LineScopeApp: pattern generator window>>=
+Window("New Test Pattern", id: TestPatternGeneratorView.windowID) {
+    TestPatternGeneratorView()
+}
+.windowResizability(.contentSize)
+@
+
+<<LineScopeApp: inspector window>>=
+Window("Inspector", id: InspectorView.windowID) {
+    InspectorView()
+}
+.defaultSize(width: 340, height: 760)
+.defaultPosition(.topTrailing)
+@
+
+\section{The image document}
+
+A document is decoded once, when it is opened, into three things: the float
+[[PixelBuffer]] all analysis works on, a [[CGImage]] made \emph{from that buffer} for display,
+and a record of facts about the file. Displaying the buffer's own rendering, not the decoded file
+image, guarantees that what the user sees is exactly the data being analyzed.
+
+<<LineScope/Document/ImageDocument.swift>>=
+import ImageIO
+import LineScopeCore
+import SwiftUI
+import UniformTypeIdentifiers
+
+<<ImageDocument: source information>>
+
+<<ImageDocument: the document type>>
+@
+
+The facts are gathered before the conversion to 8-bit sRGB can hide them (Chapter~\ref{ch:pixels}):
+the original bit depth, color space and alpha. The inspector shows them, so a user who opened a
+16-bit or CMYK file knows it was converted.
+
+<<ImageDocument: source information>>=
+/// Facts about the file as decoded, before conversion to the working float buffer.
+struct SourceInfo {
+    var fileType: String
+    var pixelWidth: Int
+    var pixelHeight: Int
+    var bitsPerComponent: Int
+    var bitsPerPixel: Int
+    var colorSpaceName: String
+    var hasAlpha: Bool
+    var dpi: Double?
+}
+@
+
+The document accepts any image type ImageIO can read. It is a value type holding immutable data,
+which is all [[FileDocument]] needs for viewing.
+
+<<ImageDocument: the document type>>=
+/// Read-only image document. Pixels are decoded once into a `PixelBuffer`; EXIF orientation is ignored
+/// on purpose so analysis runs on the stored pixel grid.
+struct ImageDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.image] }
+
+    let buffer: PixelBuffer
+    let displayImage: CGImage
+    let info: SourceInfo
+
+    <<ImageDocument: reading a file>>
+
+    <<ImageDocument: a generated test pattern>>
+
+    <<ImageDocument: refusing to write>>
+}
+@
+
+Reading takes the first image of the file, converts it and renders it back. Any failure along the
+chain is reported as a corrupt file, which makes the system show its standard error alert.
+
+One decision is visible only by its absence: the EXIF orientation tag is \emph{not} applied. A photo
+taken in portrait may therefore appear rotated. Applying the tag would mean rotating or mirroring the
+pixel grid, and LineScope's purpose is to analyze the grid exactly as stored.
+
+<<ImageDocument: reading a file>>=
+init(configuration: ReadConfiguration) throws {
+    <<ImageDocument: decoding the first image>>
+
+    <<ImageDocument: recording facts about the source>>
+}
+@
+
+<<ImageDocument: decoding the first image>>=
+guard
+    let data = configuration.file.regularFileContents,
+    let source = CGImageSourceCreateWithData(data as CFData, nil),
+    let cg = CGImageSourceCreateImageAtIndex(source, 0, nil),
+    let buffer = PixelBuffer(cgImage: cg),
+    let display = buffer.makeCGImage()
+else { throw CocoaError(.fileReadCorruptFile) }
+@
+
+The file type comes from ImageIO's type identifier, turned into a readable description such as
+``PNG image''. The color space name loses its [[kCGColorSpace]] prefix. An image has alpha unless its
+alpha info says the fourth channel is absent or to be skipped.
+
+<<ImageDocument: recording facts about the source>>=
+let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+let type = (CGImageSourceGetType(source) as String?).flatMap { UTType($0)?.localizedDescription }
+let alpha = cg.alphaInfo
+self.buffer = buffer
+self.displayImage = display
+self.info = SourceInfo(
+    fileType: type ?? "Image",
+    pixelWidth: cg.width,
+    pixelHeight: cg.height,
+    bitsPerComponent: cg.bitsPerComponent,
+    bitsPerPixel: cg.bitsPerPixel,
+    colorSpaceName: (cg.colorSpace?.name as String?)?.replacingOccurrences(of: "kCGColorSpace", with: "") ?? "Unknown",
+    hasAlpha: !(alpha == .none || alpha == .noneSkipFirst || alpha == .noneSkipLast),
+    dpi: props?[kCGImagePropertyDPIWidth] as? Double
+)
+@
+
+A generated pattern becomes a document too, so that it can be shown in exactly the same window as a
+file. Its facts describe the float buffer itself: 32 bits per component, 128 per pixel, and no
+alpha.
+
+<<ImageDocument: a generated test pattern>>=
+/// A generated test pattern, shown in the same analysis window as a file.
+init?(pattern spec: TestPatternSpec) {
+    let buffer = TestPatternGenerator.make(spec)
+    guard let display = buffer.makeCGImage() else { return nil }
+    self.buffer = buffer
+    self.displayImage = display
+    self.info = SourceInfo(
+        fileType: "Generated test pattern",
+        pixelWidth: buffer.width,
+        pixelHeight: buffer.height,
+        bitsPerComponent: 32,
+        bitsPerPixel: 128,
+        colorSpaceName: "sRGB (float)",
+        hasAlpha: false,
+        dpi: nil
+    )
+}
+@
+
+[[FileDocument]] requires a way to write, even for a viewer. It is never called, because the
+viewing document group offers no Save command; derived images leave the program through Export
+instead (Section~\ref{sec:export}).
+
+<<ImageDocument: refusing to write>>=
+func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+    throw CocoaError(.featureUnsupported)
+}
+@
+
+\section{Variants, zones and panes}
+
+The next file holds the small types the session is made of.
+
+<<LineScope/Model/ImageVariant.swift>>=
+import CoreGraphics
+import Foundation
+import LineScopeCore
+
+<<ImageVariant: the variant type>>
+
+<<ImageVariant: zones>>
+
+<<ImageVariant: panes>>
+
+<<ImageVariant: the frequency axis>>
+
+<<ImageVariant: operation requests>>
+@
+
+A \emph{variant} is the original image or one copy derived from it. Besides its pixels and their
+rendering, it remembers its parent and the operation that produced it, and the whole
+\emph{lineage}: the operations from the original down to this copy. Storing the lineage, rather than
+walking parent links, keeps a variant's history intact when an intermediate tab is closed. A
+variant's name, shown on its tab, is the lineage joined with arrows.
+
+Variants are immutable. An operation never changes a variant; it creates a new one.
+
+<<ImageVariant: the variant type>>=
+/// The original image or one derived copy. Each copy records the chain of operations back to the original.
+struct ImageVariant: Identifiable {
+    let id = UUID()
+    let buffer: PixelBuffer
+    let cgImage: CGImage
+    let parentID: UUID?
+    let operation: ImageOperation?
+    /// Operations applied to the original, in order. Empty for the original.
+    let lineage: [ImageOperation]
+
+    var isOriginal: Bool { operation == nil }
+
+    var name: String {
+        lineage.isEmpty ? "Original" : lineage.map(\.displayName).joined(separator: " → ")
+    }
+}
+@
+
+The window is divided into three horizontal \emph{zones}. The raw values index the session's pane
+arrays.
+
+<<ImageVariant: zones>>=
+/// Which kind of content a zone shows.
+enum Zone: Int, CaseIterable, Identifiable {
+    case images, profile, spectrum
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .images: "Images"
+        case .profile: "Line Profile"
+        case .spectrum: "Spectrum"
+        }
+    }
+}
+@
+
+Each zone can be split into several side-by-side \emph{panes}, each showing one variant. A pane has
+its own identity, separate from the variant it shows, so SwiftUI keeps a pane's view state (such
+as its scroll position) when the pane switches to another variant.
+
+<<ImageVariant: panes>>=
+/// One side-by-side pane inside a zone; it shows one variant at a time.
+struct PaneState: Identifiable, Equatable {
+    let id = UUID()
+    var variantID: UUID
+}
+@
+
+The spectrum can be plotted against two frequency scales, discussed with the analysis in
+Chapter~\ref{ch:analysis}: cycles per pixel of the variant itself, or cycles along the whole line,
+which is the same for every copy.
+
+<<ImageVariant: the frequency axis>>=
+enum FrequencyAxis: String, CaseIterable, Identifiable {
+    case cyclesPerPixel
+    case cyclesPerLine
+
+    var id: String { rawValue }
+    var displayName: String { self == .cyclesPerPixel ? "cycles/pixel" : "cycles/line" }
+}
+@
+
+Some menu commands need parameters before they can run: a blur radius, a scale factor. Such a
+command doesn't run the operation; it stores an [[OperationRequest]] in the session, and the window
+presents a sheet for it. The request is [[Identifiable]] because SwiftUI's [[sheet(item:)]] requires
+it.
+
+<<ImageVariant: operation requests>>=
+/// Operations that need parameters before running; shown as a sheet.
+enum OperationRequest: Identifiable {
+    case gaussianBlur, boxBlur, unsharpMask, noiseReduction
+    case resample(ResampleMethod)
+
+    var id: String {
+        switch self {
+        case .gaussianBlur: "gaussian"
+        case .boxBlur: "box"
+        case .unsharpMask: "unsharp"
+        case .noiseReduction: "noise"
+        case .resample(let m): "resample-\(m.rawValue)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .gaussianBlur: "Gaussian Blur"
+        case .boxBlur: "Box Blur"
+        case .unsharpMask: "Sharpen (Unsharp Mask)"
+        case .noiseReduction: "Noise Reduction"
+        case .resample(let m): "Resample: \(m.displayName)"
+        }
+    }
+}
+@
+
+\section{The session}
+
+Every window has one [[Session]]. It owns the variants, the shared line, the analysis settings,
+the pane layout and the focus, and it performs operations. The views hold no state of their own
+beyond transient gestures; they read the session and write to it.
+
+The class is marked [[@Observable]]. SwiftUI records which properties each view's body reads, and
+re-renders exactly those views when one of the properties changes. This is what keeps the line in
+sync everywhere: dragging it in one pane writes [[line]], and every pane in all three zones read
+[[line]] while drawing, so all of them update in the same frame, with no notification code. The
+class is also [[@MainActor]]: all its state is touched only on the main thread, and background work
+has to hop back to it explicitly.
+
+<<LineScope/Model/Session.swift>>=
+import AppKit
+import ImageIO
+import LineScopeCore
+import SwiftUI
+import UniformTypeIdentifiers
+
+<<Session: profile and spectrum point types>>
+
+<<Session: the session class>>
+
+<<Session: the focused-value entry>>
+
+<<Session: the active session>>
+@
+
+The views plot two kinds of series. A profile keeps the raw channel values (for the spectrum and
+the inspector's statistics), the samples they came from, and a list of points for the chart. The
+points have integer identifiers because Swift Charts identifies marks, and the sample index is a
+natural, stable key.
+
+<<Session: profile and spectrum point types>>=
+struct Profile {
+    struct Point: Identifiable {
+        let id: Int
+        let x: Double
+        let y: Double
+    }
+
+    var points: [Point]
+    var values: [Float]
+    var samples: LineSamples
+}
+
+struct SpectrumPoint: Identifiable {
+    let id: Int
+    let frequency: Double
+    let magnitude: Double
+}
+@
+
+<<Session: the session class>>=
+/// All state for one document window: the variants, the shared line, and view settings.
+@MainActor @Observable
+final class Session {
+    <<Session: stored state>>
+
+    <<Session: initialization>>
+
+    <<Session: looking up variants>>
+
+    // MARK: Panes
+
+    <<Session: selecting and splitting panes>>
+
+    // MARK: Variants
+
+    <<Session: closing a variant>>
+
+    <<Session: performing an operation in the background>>
+
+    <<Session: showing a new variant>>
+
+    // MARK: Analysis
+
+    <<Session: computing a profile>>
+
+    <<Session: computing a spectrum>>
+
+    // MARK: Export
+
+    <<Session: exporting the focused variant>>
+}
+@
+
+\subsection{State}
+
+<<Session: stored state>>=
+<<Session: identity, variants and the line>>
+
+<<Session: analysis settings>>
+
+<<Session: panes, focus and pending work>>
+@
+
+The variants can only be changed by the session's own methods, which maintain the invariant that
+index 0 is the original and is never removed.
+
+The line is stored in \emph{normalized} coordinates, $(u, v) \in [0,1]^2$ relative to the image
+extent. A filtered copy has the same size as its source and a resampled copy is only scaled, so the
+same normalized line lands on the same content in every copy, however large it is. This is how a
+single line can be ``in the same position of all images, after considering filtering and
+resampling'': each pane converts it to its own pixel grid only when it draws or samples.
+
+<<Session: identity, variants and the line>>=
+let fileName: String
+let sourceInfo: SourceInfo
+
+private(set) var variants: [ImageVariant]
+var line: LineSegment = .initial
+@
+
+The analysis settings are shared by all panes, deliberately: comparing the red channel of one copy
+with the hue of another, or a Hann-windowed spectrum with a rectangular one, would be misleading.
+The one subtle setting is the channel index. The color models have different numbers of channels
+(RGBA and CMYK have four, HSL three), so switching the model resets an index that would fall
+out of range.
+
+<<Session: analysis settings>>=
+var colorModel: ColorModel = .rgba {
+    didSet { if channelIndex >= colorModel.channels.count { channelIndex = 0 } }
+}
+var channelIndex = 0
+var window: WindowFunction = .hann
+var removeMean = true
+var logMagnitude = true
+var frequencyAxis: FrequencyAxis = .cyclesPerPixel
+var useDevicePixels = false
+@
+
+The \emph{focused variant} is the one menu operations apply to and the inspector describes: the
+last one the user clicked, in any zone. Applying operations to it, rather than always to the original,
+is what lets operations chain: blur a copy, then downsample the blurred copy.
+
+[[pendingRequest]] drives the parameter sheet, [[runningOperations]] the progress indicator, and
+[[errorMessage]] an alert.
+
+<<Session: panes, focus and pending work>>=
+/// Panes per zone, indexed by `Zone.rawValue`.
+var panes: [[PaneState]]
+/// The variant operations apply to and the inspector describes.
+var focusedVariantID: UUID
+var pendingRequest: OperationRequest?
+private(set) var runningOperations = 0
+var errorMessage: String?
+@
+
+A new session has just the original, focused, shown in one pane of each zone.
+
+<<Session: initialization>>=
+init(document: ImageDocument, fileName: String) {
+    let original = ImageVariant(
+        buffer: document.buffer, cgImage: document.displayImage,
+        parentID: nil, operation: nil, lineage: []
+    )
+    self.fileName = fileName
+    self.sourceInfo = document.info
+    self.variants = [original]
+    self.focusedVariantID = original.id
+    self.panes = Zone.allCases.map { _ in [PaneState(variantID: original.id)] }
+}
+@
+
+Looking a variant up by identifier is a linear search. A session holds a handful of variants,
+and an array keeps the tab order for free. If the focused variant has disappeared, the original
+stands in for it, so [[focusedVariant]] never fails.
+
+<<Session: looking up variants>>=
+var original: ImageVariant { variants[0] }
+
+var focusedVariant: ImageVariant {
+    variant(focusedVariantID) ?? original
+}
+
+func variant(_ id: UUID) -> ImageVariant? {
+    variants.first { $0.id == id }
+}
+
+var channelName: String { colorModel.channels[channelIndex] }
+@
+
+\subsection{Panes}
+
+Selecting a tab in a pane both shows that variant there and focuses it. Splitting a zone appends
+a pane showing the first variant not yet visible in that zone, which is usually what the user wants
+to compare with; if every variant is already shown, the new pane shows the focused one. Unsplitting
+removes the last pane, never the only one.
+
+<<Session: selecting and splitting panes>>=
+func select(_ variantID: UUID, zone: Zone, pane: Int) {
+    panes[zone.rawValue][pane].variantID = variantID
+    focusedVariantID = variantID
+}
+
+func split(_ zone: Zone) {
+    let shown = Set(panes[zone.rawValue].map(\.variantID))
+    let next = variants.first { !shown.contains($0.id) } ?? focusedVariant
+    panes[zone.rawValue].append(PaneState(variantID: next.id))
+}
+
+func unsplit(_ zone: Zone) {
+    guard panes[zone.rawValue].count > 1 else { return }
+    panes[zone.rawValue].removeLast()
+}
+@
+
+\subsection{Variants and operations}
+
+Closing a variant removes its tab. The original can't be closed. Panes that showed the closed
+variant fall back to the original, and so does the focus. Variants derived from the closed one keep
+working, since each carries its own lineage.
+
+<<Session: closing a variant>>=
+func closeVariant(_ id: UUID) {
+    guard let index = variants.firstIndex(where: { $0.id == id }), index > 0 else { return }
+    variants.remove(at: index)
+    for z in panes.indices {
+        for p in panes[z].indices where panes[z][p].variantID == id {
+            panes[z][p].variantID = original.id
+        }
+    }
+    if focusedVariantID == id { focusedVariantID = original.id }
+}
+@
+
+Performing an operation must not freeze the window: resampling a large photograph with a wide
+kernel takes a noticeable fraction of a second. The session captures the source variant and its
+buffer on the main actor, then starts a task. The task itself inherits the main actor, but the
+heavy call runs in a \emph{detached} task at user-initiated priority, which runs on a background
+thread. This is safe because [[apply]] is a pure function of a [[Sendable]] buffer
+(Section~\ref{sec:operations}). When the result comes back, the rest of the task runs on the main
+actor again: it renders the image, builds the variant with its extended lineage, appends it and
+shows it.
+
+The source is captured \emph{before} the task starts, so the operation applies to the variant that
+was focused when the user chose the command, even if the focus moves while it is running.
+
+<<Session: performing an operation in the background>>=
+/// Applies an operation to the focused variant in the background and adds the result as a new tab.
+func perform(_ operation: ImageOperation) {
+    let source = focusedVariant
+    let input = source.buffer
+    runningOperations += 1
+    Task {
+        let output = await Task.detached(priority: .userInitiated) {
+            operation.apply(to: input)
+        }.value
+        runningOperations -= 1
+        guard let cg = output.makeCGImage() else {
+            errorMessage = "Could not render the result of \(operation.displayName)."
+            return
+        }
+        let variant = ImageVariant(
+            buffer: output, cgImage: cg, parentID: source.id,
+            operation: operation, lineage: source.lineage + [operation]
+        )
+        variants.append(variant)
+        show(variant.id)
+    }
+}
+@
+
+Where should a new variant appear? When a zone is split, the user is usually comparing: the left
+pane holds the baseline and the right pane the candidate. So the new variant goes into the
+\emph{last} pane of each zone, which is also the only pane when the zone is not split. It becomes
+the focus, so the next operation chains from it.
+
+<<Session: showing a new variant>>=
+/// Shows a new variant in every zone: in the last pane when split (so the left pane keeps the
+/// comparison baseline), otherwise in the only pane.
+private func show(_ id: UUID) {
+    for z in panes.indices {
+        panes[z][panes[z].count - 1].variantID = id
+    }
+    focusedVariantID = id
+}
+@
+
+\subsection{Analysis}
+
+A profile samples the line in the variant's own pixel grid (Chapter~\ref{ch:analysis}) and extracts
+the chosen channel of the chosen color model from every sample. The chart's $x$ coordinate is
+the normalized position along the line, not the sample index. A half-size copy has half as many
+samples, and with positions in $[0,1]$ its profile still lines up with the original's.
+
+These functions are called from view bodies, so they run again on every change of the line or the
+settings. That is cheap: a few thousand bilinear samples and one FFT.
+
+<<Session: computing a profile>>=
+func profile(for variant: ImageVariant) -> Profile {
+    let samples = LineSampler.sample(variant.buffer, along: line)
+    let values = samples.colors.map {
+        ColorConversion.value(of: $0, model: colorModel, channel: channelIndex)
+    }
+    let points = values.indices.map { Profile.Point(id: $0, x: samples.positions[$0], y: Double(values[$0])) }
+    return Profile(points: points, values: values, samples: samples)
+}
+@
+
+The spectrum of a profile is computed with the current window and mean setting. The sample spacing
+is guarded away from zero, which it would be for a line of zero length. For plotting, each bin gets
+its frequency on the chosen axis, and its amplitude, optionally in decibels,
+\[
+  A_{\mathrm{dB}} = \max\bigl(20\log_{10} A,\ -100\bigr).
+\]
+The floor keeps empty bins, whose logarithm would be $-\infty$, on the chart.
+
+<<Session: computing a spectrum>>=
+func spectrum(for profile: Profile) -> SpectrumResult {
+    SpectrumAnalyzer.compute(
+        profile.values, spacing: max(profile.samples.spacing, 1e-9),
+        window: window, removeMean: removeMean
+    )
+}
+
+func spectrumPoints(_ s: SpectrumResult) -> [SpectrumPoint] {
+    let freqs = frequencyAxis == .cyclesPerPixel ? s.cyclesPerPixel : s.cyclesPerLine
+    return s.amplitudes.indices.map { i in
+        let a = s.amplitudes[i]
+        return SpectrumPoint(
+            id: i, frequency: freqs[i],
+            magnitude: logMagnitude ? max(20 * log10(max(a, 1e-12)), Self.dBFloor) : a
+        )
+    }
+}
+
+static let dBFloor = -100.0
+@
+
+\subsection{Export}\label{sec:export}
+
+Exporting writes the focused variant as a PNG. The proposed name combines the file's base name with
+the variant's lineage, with the arrows and slashes that can't appear in a file name replaced. The
+image written is the variant's display image, which is exactly what is on screen: 8-bit, sRGB.
+
+<<Session: exporting the focused variant>>=
+func exportFocused() {
+    let variant = focusedVariant
+    let panel = NSSavePanel()
+    panel.allowedContentTypes = [.png]
+    let base = (fileName as NSString).deletingPathExtension
+    let suffix = variant.isOriginal ? "original" : variant.name
+        .replacingOccurrences(of: " → ", with: "_")
+        .replacingOccurrences(of: "/", with: "-")
+    panel.nameFieldStringValue = "\(base)-\(suffix).png"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    guard
+        let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+    else {
+        errorMessage = "Could not create \(url.lastPathComponent)."
+        return
+    }
+    CGImageDestinationAddImage(dest, variant.cgImage, nil)
+    if !CGImageDestinationFinalize(dest) {
+        errorMessage = "Could not write \(url.lastPathComponent)."
+    }
+}
+@
+
+\subsection{Finding the session from outside the window}
+
+Menus must act on the session of the window the user is working in. SwiftUI's \emph{focused
+values} provide exactly this: a window publishes its session, and the menu commands read the
+value of the key window. The entry is declared with the [[@Entry]] macro.
+
+<<Session: the focused-value entry>>=
+extension FocusedValues {
+    @Entry var session: Session?
+}
+@
+
+Focused values fail in one case, and it matters here: the inspector. While the user interacts with
+the inspector window, \emph{it} is the key window, and it has no session, so a focused value would
+be [[nil]] just when the inspector needs it. The app therefore also keeps track of the session of
+the most recently key \emph{document} window, in a shared observable object. Document windows
+update it as they become key (Chapter~\ref{ch:views}), the inspector reads it, and the menus use it
+as a fallback.
+
+<<Session: the active session>>=
+/// The session of the most recently key document window, for the inspector window (which is itself
+/// key while being used, so focused values would not reach it).
+@MainActor @Observable
+final class ActiveSession {
+    static let shared = ActiveSession()
+    var session: Session?
+}
+@

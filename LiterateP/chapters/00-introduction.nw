@@ -1,0 +1,139 @@
+\chapter{Introduction}
+
+LineScope is a small macOS program for \emph{looking} at what resampling and filtering do to an
+image. You open an image, derive copies from it (blurred, sharpened, shrunk with nearest-neighbor,
+enlarged with Lanczos, and so on), and draw a line across it. For every copy the program shows three
+things side by side:
+\begin{enumerate}
+\item the image itself, at its true pixel scale, with the line drawn on it;
+\item the \emph{profile}: one color channel sampled along the line;
+\item the \emph{spectrum}: the Fourier transform of that profile.
+\end{enumerate}
+Because the line is shared, moving it in one copy moves it in all of them, and the differences
+between the methods become visible at once. Aliasing shows as false energy below the Nyquist
+frequency, over-smoothing as a spectrum that dies too early, and ringing as ripples beside an edge.
+
+\section{How to read this document}
+
+This is a \emph{literate program} in the sense of Donald Knuth~\cite{knuth84}: a document written
+for people, from which the program for the machine is extracted. The code appears in
+\emph{chunks}. Each chunk has a name and a number, and is written
+\[
+  \langle\textit{name}\ \textsf{\small n}\rangle \equiv
+\]
+where it is defined. A chunk may use other chunks by name; that is how a long function is explained
+a piece at a time, in the order that makes the ideas clear rather than the order the compiler
+wants. When the same name is defined again, the new text is appended to the old, and the header
+reads $+\!\equiv$. Below each chunk, a note tells where it is continued and where it is used.
+
+The chunk index at the end of the book lists every chunk.
+
+Two tools turn this document into something useful:
+\begin{description}[style=nextline]
+\item[Tangling] follows the references from each \emph{root} chunk and writes the source file the
+  chunk is named after. The roots of this web are exactly the source files of the project, so
+  tangling rebuilds LineScope from this document.
+\item[Weaving] produces the \LaTeX{} you are reading, with the cross-references.
+\end{description}
+The directory [[LiterateP]] holds the web ([[chapters/*.nw]]), the tool [[lit.py]] that does
+both jobs using Norman Ramsey's noweb notation~\cite{ramsey94}, and a [[Makefile]]. Running
+[[make check]] tangles the web and compares every file, byte for byte, with the real sources in
+the repository. So this document can't drift away from the program without the check noticing.
+
+\section{The shape of the program}
+
+The code is split in two.
+
+The first part is [[LineScopeCore]], a Swift package with no user interface. It holds everything
+numeric: the pixel buffer (Chapter~\ref{ch:pixels}), resampling (Chapter~\ref{ch:resampling}),
+filters (Chapter~\ref{ch:filters}), line sampling, color models and the spectrum
+(Chapter~\ref{ch:analysis}), and generated test patterns (Chapter~\ref{ch:patterns}). It is
+tested on its own (Chapter~\ref{ch:tests}).
+
+The second part is the app, [[LineScope]]. It holds the document and the per-window session
+model (Chapter~\ref{ch:model}), the SwiftUI views (Chapter~\ref{ch:views}) and the menus
+(Chapter~\ref{ch:commands}).
+
+This split keeps the mathematics testable without a window, and keeps the views thin: a view
+asks the session for a profile or a spectrum and draws it.
+
+\section{Building}
+
+The Xcode project isn't kept in the repository. XcodeGen~\cite{xcodegen} generates it from a
+short specification. The app target depends on the local package, is a document \emph{viewer}
+for any image type, and is signed ad hoc so it runs without a developer account.
+
+<<project.yml>>=
+name: LineScope
+options:
+  bundleIdPrefix: co.edu.uniandes
+  deploymentTarget:
+    macOS: "15.0"
+packages:
+  LineScopeCore:
+    path: Packages/LineScopeCore
+targets:
+  LineScope:
+    type: application
+    platform: macOS
+    sources: [LineScope]
+    dependencies:
+      - package: LineScopeCore
+    info:
+      path: LineScope/Info.plist
+      properties:
+        CFBundleDisplayName: LineScope
+        LSApplicationCategoryType: public.app-category.graphics-design
+        NSHumanReadableCopyright: ""
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Image
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.image]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.edu.uniandes.LineScope
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: NO
+@ The rank [[Alternate]] means LineScope offers to open images but never claims to be their default
+application.
+
+The package manifest declares one library and its tests. One line deserves comment. Swift in a
+Debug build is compiled without optimization, and the inner loops of resampling and filtering then
+run tens of times slower, since every array access is bounds-checked and nothing is inlined. The
+manifest therefore asks for [[-O]] even in Debug. This uses [[unsafeFlags]], which the Swift
+Package Manager allows only for local packages like this one.
+
+<<Packages/LineScopeCore/Package.swift>>=
+// swift-tools-version: 5.10
+import PackageDescription
+
+let package = Package(
+    name: "LineScopeCore",
+    platforms: [.macOS(.v14)],
+    products: [
+        .library(name: "LineScopeCore", targets: ["LineScopeCore"]),
+    ],
+    targets: [
+        .target(
+            name: "LineScopeCore",
+            // Pixel loops are unusably slow at -Onone; optimize even in Debug.
+            swiftSettings: [.unsafeFlags(["-O"], .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "LineScopeCoreTests",
+            dependencies: ["LineScopeCore"]
+        ),
+    ]
+)
+@ With these two files in place, the commands are:
+\begin{lstlisting}[language={}]
+xcodegen generate
+xcodebuild -project LineScope.xcodeproj -scheme LineScope build
+cd Packages/LineScopeCore && swift test
+\end{lstlisting}

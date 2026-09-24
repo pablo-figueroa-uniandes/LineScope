@@ -1,0 +1,1283 @@
+\chapter{Views}\label{ch:views}
+
+The views are deliberately thin. Every number they show comes from the [[Session]] of
+Chapter~\ref{ch:model}: a view asks it for the variants, the shared line, a profile or a spectrum,
+and draws the answer. What the views do own is \emph{interaction}: which pane shows which variant,
+how a drag on an image turns into a new line, and how the controls in each zone header write back
+into the session. Because the session is an observable object, writing the line from one pane is
+enough to redraw every image, profile and spectrum in the window.
+
+The chapter follows the window from the outside in: the window and its three zones, the panes and
+their tabs, the image canvas where the line is drawn, the two charts, and then the auxiliary
+windows (the parameter sheet, the inspector and the test-pattern windows).
+
+\section{The document window}
+
+A document window is three zones stacked vertically: images, line profile, spectrum. The window
+owns one [[Session]], created from the document when the window opens.
+
+<<LineScope/Views/MainView.swift>>=
+import LineScopeCore
+import SwiftUI
+
+struct MainView: View {
+    <<MainView: the session is created once per window>>
+
+    var body: some View {
+        <<MainView: three zones stacked vertically>>
+        <<MainView: publishing the session to menus and inspector>>
+        <<MainView: sheets, alerts and the progress indicator>>
+    }
+}
+
+<<MainView.swift: the window observer>>
+@ SwiftUI may call a view's initializer many times, but a [[@State]] property is initialized only
+the first time; later values passed to [[State(initialValue:)]] are ignored. That is exactly the
+lifetime we want: one session per window, surviving every redraw.
+
+<<MainView: the session is created once per window>>=
+@State private var session: Session
+
+init(document: ImageDocument, fileName: String) {
+    _session = State(initialValue: Session(document: document, fileName: fileName))
+}
+@ The zones sit in a [[VSplitView]], so the user can drag the dividers between them. The ideal
+heights give the images most of the room at first; the minimum sizes keep every zone's header and
+at least a sliver of its content visible.
+
+<<MainView: three zones stacked vertically>>=
+VSplitView {
+    ZoneView(zone: .images, session: session)
+        .frame(minHeight: 180, idealHeight: 420)
+    ZoneView(zone: .profile, session: session)
+        .frame(minHeight: 140, idealHeight: 220)
+    ZoneView(zone: .spectrum, session: session)
+        .frame(minHeight: 140, idealHeight: 220)
+}
+.frame(minWidth: 720, minHeight: 560)
+@ Two other parts of the app need to find this window's session. The menus
+(Chapter~\ref{ch:commands}) read it as a \emph{focused scene value}, which SwiftUI provides for the
+key window. The inspector cannot do that. It is a window of its own, and while the user works in it
+\emph{it} is the key window, so the focused value would vanish just when it is needed. Instead, the
+document window reports itself to the shared [[ActiveSession]] whenever it becomes key, and
+withdraws when it closes (but only if it is still the active one, since another window may have
+become key in between).
+
+<<MainView: publishing the session to menus and inspector>>=
+.focusedSceneValue(\.session, session)
+.background(WindowKeyObserver(
+    onBecomeKey: { ActiveSession.shared.session = session },
+    onClose: {
+        if ActiveSession.shared.session === session { ActiveSession.shared.session = nil }
+    }
+))
+@ The session also drives three transient pieces of UI. Setting its [[pendingRequest]] presents the
+parameter sheet (Section~\ref{sec:parameter-sheet}). Setting its [[errorMessage]] shows an alert,
+and dismissing the alert clears the message again through the hand-made binding. While background
+operations run, a small spinner appears in the toolbar.
+
+<<MainView: sheets, alerts and the progress indicator>>=
+.sheet(item: $session.pendingRequest) { request in
+    ParameterSheet(request: request, session: session)
+}
+.alert(
+    "Operation failed",
+    isPresented: Binding(get: { session.errorMessage != nil }, set: { if !$0 { session.errorMessage = nil } }),
+    presenting: session.errorMessage
+) { _ in
+    Button("OK") {}
+} message: { Text($0) }
+.toolbar {
+    ToolbarItem(placement: .status) {
+        if session.runningOperations > 0 {
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+@ SwiftUI has no notification for ``this window became key''. So we place an invisible AppKit view
+in the background of the window's content. An [[NSView]] knows its [[NSWindow]], and through it can
+observe the window's notifications. The representable just forwards the two callbacks.
+
+<<MainView.swift: the window observer>>=
+/// Reports when the hosting window becomes key or closes.
+struct WindowKeyObserver: NSViewRepresentable {
+    var onBecomeKey: () -> Void
+    var onClose: () -> Void
+
+    func makeNSView(context: Context) -> ObserverView { ObserverView() }
+
+    func updateNSView(_ view: ObserverView, context: Context) {
+        view.onBecomeKey = onBecomeKey
+        view.onClose = onClose
+    }
+
+    <<WindowKeyObserver: the observing NSView>>
+}
+@ The view learns its window in [[viewDidMoveToWindow]], which also runs if the view ever moves to
+another window, so old observers are removed first. Notifications are delivered on the main queue.
+The closures are nonisolated as far as the compiler knows, so [[MainActor.assumeIsolated]] states
+what is true at run time. A window that is \emph{already} key when the view arrives won't send
+[[didBecomeKeyNotification]] again, so that case is reported directly, one run-loop turn later, after
+SwiftUI has finished installing the view.
+
+<<WindowKeyObserver: the observing NSView>>=
+final class ObserverView: NSView {
+    var onBecomeKey: () -> Void = {}
+    var onClose: () -> Void = {}
+    private var tokens: [NSObjectProtocol] = []
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        tokens.forEach(NotificationCenter.default.removeObserver)
+        tokens = []
+        guard let window else { return }
+        let center = NotificationCenter.default
+        tokens.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.onBecomeKey() }
+        })
+        tokens.append(center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.onClose() }
+        })
+        if window.isKeyWindow {
+            DispatchQueue.main.async { [weak self] in self?.onBecomeKey() }
+        }
+    }
+
+    deinit {
+        tokens.forEach(NotificationCenter.default.removeObserver)
+    }
+}
+@
+
+\section{Zones}
+
+A zone is a header bar followed by one or more panes side by side. The panes of a zone are listed
+in [[session.panes]], indexed by the zone's raw value, so splitting a zone is only a matter of
+appending to that list. [[ZoneView]] is [[@Bindable]] because its header controls write straight
+into the session.
+
+<<LineScope/Views/ZoneView.swift>>=
+import LineScopeCore
+import SwiftUI
+
+/// One horizontal zone: a header with its controls, and one or more side-by-side panes.
+struct ZoneView: View {
+    let zone: Zone
+    @Bindable var session: Session
+
+    <<ZoneView: header above side-by-side panes>>
+
+    <<ZoneView: the header row>>
+
+    <<ZoneView: controls specific to each zone>>
+
+    <<ZoneView: split and unsplit buttons>>
+
+    <<ZoneView: describing the line>>
+}
+@ The panes are laid out in an [[HSplitView]], so their widths can be adjusted by hand. Each pane
+gets its index, which is how it finds its own entry in the session's pane list. The [[ForEach]] is
+keyed by the pane's identity rather than its index, so removing the last pane doesn't rebuild
+the others.
+
+<<ZoneView: header above side-by-side panes>>=
+var body: some View {
+    VStack(spacing: 0) {
+        header
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.bar)
+        Divider()
+        HSplitView {
+            ForEach(Array(session.panes[zone.rawValue].enumerated()), id: \.element.id) { index, _ in
+                PaneView(zone: zone, paneIndex: index, session: session)
+                    .frame(minWidth: 200)
+            }
+        }
+    }
+}
+@ Every header has the same shape: the zone's title on the left, then its own controls, then the
+split buttons on the right.
+
+<<ZoneView: the header row>>=
+private var header: some View {
+    HStack(spacing: 12) {
+        Text(zone.title).font(.headline)
+        Spacer(minLength: 8)
+        controls
+        Divider().frame(height: 16)
+        splitButtons
+    }
+    .controlSize(.small)
+}
+@ The controls differ by zone.
+
+<<ZoneView: controls specific to each zone>>=
+@ViewBuilder
+private var controls: some View {
+    switch zone {
+    case .images:
+        <<ZoneView: image-zone controls>>
+    case .profile:
+        <<ZoneView: profile-zone controls>>
+    case .spectrum:
+        <<ZoneView: spectrum-zone controls>>
+    }
+}
+@ The image zone shows where the line is and offers to put it back in its initial place: the full
+width of the image, at mid-height.
+
+<<ZoneView: image-zone controls>>=
+Text(lineDescription)
+    .font(.caption.monospacedDigit())
+    .foregroundStyle(.secondary)
+Button("Reset Line") { session.line = .initial }
+@ The profile zone chooses the color model and the channel. They are settings of the
+\emph{session}, not of a pane, so every profile and every spectrum in the window shows the same
+channel. Comparisons between variants stay meaningful. The list of channels depends on the model
+(RGBA has four, HSL three), so the second picker is rebuilt from [[colorModel.channels]].
+
+<<ZoneView: profile-zone controls>>=
+Picker("Color space", selection: $session.colorModel) {
+    ForEach(ColorModel.allCases) { Text($0.displayName).tag($0) }
+}
+.pickerStyle(.segmented)
+.fixedSize()
+Picker("Channel", selection: $session.channelIndex) {
+    ForEach(Array(session.colorModel.channels.enumerated()), id: \.offset) { i, name in
+        Text(name).tag(i)
+    }
+}
+.pickerStyle(.segmented)
+.fixedSize()
+@ The spectrum zone controls how the profile is transformed. There is the window function (a Hann
+window~\cite{harris78} reduces the leakage caused by the finite line), the unit of the frequency
+axis, whether to subtract the mean first (otherwise the DC term dwarfs everything else), and
+whether amplitudes are shown in decibels.
+
+<<ZoneView: spectrum-zone controls>>=
+Picker("Window", selection: $session.window) {
+    ForEach(WindowFunction.allCases) { Text($0.displayName).tag($0) }
+}
+.fixedSize()
+Picker("Axis", selection: $session.frequencyAxis) {
+    ForEach(FrequencyAxis.allCases) { Text($0.displayName).tag($0) }
+}
+.fixedSize()
+Toggle("Remove mean", isOn: $session.removeMean)
+Toggle("dB", isOn: $session.logMagnitude)
+@ Splitting adds a pane and unsplitting removes the last one; a zone always keeps at least one.
+The same actions are in the View menu.
+
+<<ZoneView: split and unsplit buttons>>=
+private var splitButtons: some View {
+    HStack(spacing: 4) {
+        Button {
+            session.split(zone)
+        } label: {
+            Image(systemName: "rectangle.split.2x1")
+        }
+        .help("Split: add a pane to \(zone.title)")
+        Button {
+            session.unsplit(zone)
+        } label: {
+            Image(systemName: "rectangle")
+        }
+        .help("Unsplit: remove the last pane")
+        .disabled(session.panes[zone.rawValue].count < 2)
+    }
+    .labelsHidden()
+}
+@ The line is stored in normalized coordinates, with $(0,0)$ at the top-left corner and $(1,1)$ at
+the bottom-right corner of every image. So the same numbers describe it in all variants, whatever
+their size. Three decimals are finer than a pixel for any image up to a thousand pixels wide.
+
+<<ZoneView: describing the line>>=
+private var lineDescription: String {
+    let l = session.line
+    func p(_ v: Double) -> String { v.formatted(.number.precision(.fractionLength(3))) }
+    return "(\(p(l.start.x)), \(p(l.start.y))) → (\(p(l.end.x)), \(p(l.end.y)))"
+}
+@
+
+\section{Panes and tabs}
+
+Each pane shows one variant, chosen with a strip of tabs that lists all of them. The tab strips of
+all panes list the same variants in the same order: the order in which they were made. What a pane
+shows depends on its zone: the image, its profile, or its spectrum.
+
+<<LineScope/Views/PaneView.swift>>=
+import SwiftUI
+
+/// A tab strip listing every variant, plus the zone's content for the selected one.
+struct PaneView: View {
+    let zone: Zone
+    let paneIndex: Int
+    let session: Session
+
+    <<PaneView: which variant this pane shows>>
+
+    <<PaneView: tab strip above the zone's content>>
+}
+
+<<PaneView.swift: the tab strip>>
+@ A pane's selection is looked up rather than stored in the view, so it survives redraws and can be
+changed by the session. When a variant is closed, the session moves every pane that showed it back
+to the original. The fallbacks cover the brief moments during an update when a pane index or a
+variant no longer exists: the original is always there.
+
+<<PaneView: which variant this pane shows>>=
+private var selectedID: UUID {
+    let panes = session.panes[zone.rawValue]
+    return paneIndex < panes.count ? panes[paneIndex].variantID : session.original.id
+}
+@ Selecting a tab also makes that variant the \emph{focused} one, the target of the next menu
+operation.
+
+<<PaneView: tab strip above the zone's content>>=
+var body: some View {
+    let variant = session.variant(selectedID) ?? session.original
+    VStack(spacing: 0) {
+        TabStrip(session: session, selectedID: variant.id) { id in
+            session.select(id, zone: zone, pane: paneIndex)
+        }
+        Divider()
+        Group {
+            switch zone {
+            case .images: ImageCanvas(variant: variant, session: session)
+            case .profile: ProfileChart(variant: variant, session: session)
+            case .spectrum: SpectrumChart(variant: variant, session: session)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+@ The tab strip scrolls horizontally when there are more variants than fit. Each tab is a plain
+button whose label is drawn by hand. Its context menu offers the per-variant commands.
+
+<<PaneView.swift: the tab strip>>=
+private struct TabStrip: View {
+    let session: Session
+    let selectedID: UUID
+    let onSelect: (UUID) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                ForEach(session.variants) { v in
+                    let selected = v.id == selectedID
+                    Button {
+                        onSelect(v.id)
+                    } label: {
+                        <<TabStrip: a tab's label>>
+                    }
+                    .buttonStyle(.plain)
+                    .help(v.name)
+                    .contextMenu {
+                        <<TabStrip: a tab's context menu>>
+                    }
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+        }
+    }
+}
+@ A tab shows the variant's name (its chain of operations) and its pixel size, which is the quickest
+way to tell a resampled copy from a filtered one. Two kinds of state are marked: a tinted
+background for the variant this pane shows, and a small dot for the window's focused variant.
+They differ as soon as a zone is split.
+
+<<TabStrip: a tab's label>>=
+HStack(spacing: 4) {
+    if v.id == session.focusedVariantID {
+        Circle().fill(Color.accentColor).frame(width: 5, height: 5)
+    }
+    Text(v.name).lineLimit(1)
+    Text("\(v.buffer.width)×\(v.buffer.height)")
+        .foregroundStyle(.secondary)
+}
+.font(.caption)
+.padding(.horizontal, 8)
+.padding(.vertical, 3)
+.background(
+    RoundedRectangle(cornerRadius: 5)
+        .fill(selected ? Color.accentColor.opacity(0.22) : Color.clear)
+)
+.contentShape(Rectangle())
+@ Export works on the focused variant, so the tab is selected first. The original can't be closed:
+every other variant descends from it.
+
+<<TabStrip: a tab's context menu>>=
+Button("Export Image…") {
+    onSelect(v.id)
+    session.exportFocused()
+}
+Button("Close Tab") { session.closeVariant(v.id) }
+    .disabled(v.isOriginal)
+@
+
+\section{The image canvas}
+
+The image zone must show each variant \emph{at its true scale}: one pixel of the image is one
+point on the screen. A copy shrunk to half size then really looks half as big, and its blockiness
+or blur is seen as it is, not hidden by the display's own interpolation. On a Retina display a
+point is two device pixels, so by default each image pixel is a $2\times2$ block. The View menu's
+``Actual Device Pixels'' option maps one image pixel to one device pixel instead.
+
+On top of the image lies the selection line, which the user can drag.
+
+<<LineScope/Views/ImageCanvas.swift>>=
+import AppKit
+import LineScopeCore
+import SwiftUI
+
+/// Shows a variant at its true scale (1 image pixel = 1 point, or 1 device pixel) with scrolling,
+/// and lets the user drag the shared selection line.
+struct ImageCanvas: View {
+    let variant: ImageVariant
+    @Bindable var session: Session
+    @Environment(\.displayScale) private var displayScale
+    @State private var drag: DragState?
+
+    <<ImageCanvas: the state of a drag>>
+
+    <<ImageCanvas: drawing the image at true scale>>
+
+    <<ImageCanvas: the line gesture>>
+
+    <<ImageCanvas: hit testing the line>>
+
+    <<ImageCanvas: updating the line during a drag>>
+
+    <<ImageCanvas: Shift snapping>>
+
+    <<ImageCanvas: coordinate conversions>>
+}
+
+<<ImageCanvas.swift: the line overlay>>
+@ A drag does one of four things, depending on where it starts. It moves the start point, moves
+the end point, moves the whole segment, or draws a new segment from scratch. The line as it was
+when the drag began is kept, because every update is computed from that initial line and the
+gesture's total movement, never from the previous update. Small errors therefore cannot pile up
+over a long drag.
+
+<<ImageCanvas: the state of a drag>>=
+private struct DragState {
+    enum Mode { case start, end, whole, draw }
+    var mode: Mode
+    var initial: LineSegment
+}
+@ [[Image(decorative:scale:)]] takes the scale of the bitmap. A scale of 1 draws a pixel per point,
+and the display's scale factor draws a pixel per device pixel. In both cases [[size]] is the
+image's extent in points, and interpolation is turned off so enlarged pixels stay square.
+
+The image and its overlay are given exactly that size, and the gesture is attached to that
+fixed-size frame, \emph{inside} the scroll view. As a result the gesture's coordinates are
+coordinates in the image. They don't depend on scrolling or on the empty margin around a small
+image, and dividing by [[size]] gives normalized coordinates directly. The outer frame, as large as
+the pane, only centers a small image in it. A tap focuses the variant without touching the line.
+
+<<ImageCanvas: drawing the image at true scale>>=
+var body: some View {
+    let scale = session.useDevicePixels ? displayScale : 1
+    let size = CGSize(width: CGFloat(variant.buffer.width) / scale, height: CGFloat(variant.buffer.height) / scale)
+    GeometryReader { geo in
+        ScrollView([.horizontal, .vertical]) {
+            ZStack {
+                Image(decorative: variant.cgImage, scale: scale)
+                    .interpolation(.none)
+                LineOverlay(line: session.line)
+                    .allowsHitTesting(false)
+            }
+            .frame(width: size.width, height: size.height)
+            .contentShape(Rectangle())
+            .gesture(lineGesture(size: size))
+            .simultaneousGesture(TapGesture().onEnded { session.focusedVariantID = variant.id })
+            .frame(minWidth: geo.size.width, minHeight: geo.size.height)
+        }
+    }
+    .background(Color(nsColor: .underPageBackgroundColor))
+}
+@ The drag decides its mode on its first change and remembers it until it ends. A minimum distance of
+two points keeps a plain click from being taken as a zero-length new line. Writing
+[[session.line]] is all it takes to move the line in every pane of every zone.
+
+<<ImageCanvas: the line gesture>>=
+private func lineGesture(size: CGSize) -> some Gesture {
+    DragGesture(minimumDistance: 2)
+        .onChanged { g in
+            if drag == nil {
+                drag = DragState(mode: hitTest(g.startLocation, size: size), initial: session.line)
+                session.focusedVariantID = variant.id
+            }
+            guard let drag else { return }
+            session.line = updatedLine(drag, gesture: g, size: size)
+        }
+        .onEnded { _ in drag = nil }
+}
+@ Hit testing works in points, so the targets are the same size whatever the image's scale. The
+endpoints come first and are a little more generous (9 points) than the segment (6 points), so an
+endpoint can always be grabbed even where it touches the segment. A drag that starts anywhere else
+draws a new line.
+
+<<ImageCanvas: hit testing the line>>=
+private func hitTest(_ p: CGPoint, size: CGSize) -> DragState.Mode {
+    let a = point(session.line.start, size)
+    let b = point(session.line.end, size)
+    if distance(p, a) <= 9 { return .start }
+    if distance(p, b) <= 9 { return .end }
+    if distanceToSegment(p, a, b) <= 6 { return .whole }
+    return .draw
+}
+@ Moving an endpoint or drawing a new line places a point where the pointer is. That point has been
+clamped to the image, so a line can reach the image's edge but never pass it.
+
+<<ImageCanvas: updating the line during a drag>>=
+private func updatedLine(_ drag: DragState, gesture g: DragGesture.Value, size: CGSize) -> LineSegment {
+    let shift = NSEvent.modifierFlags.contains(.shift)
+    let current = normalized(g.location, size)
+    var line = drag.initial
+    switch drag.mode {
+    case .start:
+        line.start = snapped(current, anchor: line.end, size: size, enabled: shift)
+    case .end:
+        line.end = snapped(current, anchor: line.start, size: size, enabled: shift)
+    case .draw:
+        line.start = normalized(g.startLocation, size)
+        line.end = snapped(current, anchor: line.start, size: size, enabled: shift)
+    case .whole:
+        <<ImageCanvas: moving the whole segment without leaving the image>>
+    }
+    return line
+}
+@ Moving the whole segment is different. Clamping each endpoint separately would squash the segment
+against the edge and change its length and angle. Instead the \emph{offset} is clamped, so that both
+endpoints stay inside. If the initial endpoints have $x$ coordinates $x_s$ and $x_e$, the
+horizontal offset $\Delta x$ must satisfy
+\[
+  -\min(x_s, x_e) \;\le\; \Delta x \;\le\; 1 - \max(x_s, x_e),
+\]
+and the same holds vertically. Within that range the segment keeps its shape exactly; at the limit
+it slides along the edge.
+
+<<ImageCanvas: moving the whole segment without leaving the image>>=
+// Move both endpoints, limiting the offset so neither leaves the image.
+var dx = g.translation.width / size.width
+var dy = g.translation.height / size.height
+let i = drag.initial
+dx = min(max(dx, -min(i.start.x, i.end.x)), 1 - max(i.start.x, i.end.x))
+dy = min(max(dy, -min(i.start.y, i.end.y)), 1 - max(i.start.y, i.end.y))
+line.start = NormalizedPoint(x: i.start.x + dx, y: i.start.y + dy)
+line.end = NormalizedPoint(x: i.end.x + dx, y: i.end.y + dy)
+@ Holding Shift makes the segment exactly horizontal or vertical, which is what a profile along a
+row or a column needs. Which of the two is decided by the larger displacement \emph{in pixels}, not
+in normalized units. In a wide image a normalized step of $0.1$ across is much longer than $0.1$
+down, and comparing normalized values would snap the wrong way.
+
+<<ImageCanvas: Shift snapping>>=
+/// With Shift held, constrains the segment to horizontal or vertical (in pixel space).
+private func snapped(_ p: NormalizedPoint, anchor: NormalizedPoint, size: CGSize, enabled: Bool) -> NormalizedPoint {
+    guard enabled else { return p }
+    let dx = abs(p.x - anchor.x) * size.width
+    let dy = abs(p.y - anchor.y) * size.height
+    return dx >= dy ? NormalizedPoint(x: p.x, y: anchor.y) : NormalizedPoint(x: anchor.x, y: p.y)
+}
+@ The remaining helpers convert between points and normalized coordinates, and measure distances.
+The distance to a segment projects the point onto the segment's line, with the parameter $t$
+clamped to $[0,1]$ so the nearest point stays between the endpoints. A degenerate segment is
+treated as a point.
+
+<<ImageCanvas: coordinate conversions>>=
+private func normalized(_ p: CGPoint, _ size: CGSize) -> NormalizedPoint {
+    NormalizedPoint(x: p.x / size.width, y: p.y / size.height).clamped()
+}
+
+private func point(_ n: NormalizedPoint, _ size: CGSize) -> CGPoint {
+    CGPoint(x: n.x * size.width, y: n.y * size.height)
+}
+
+private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+    hypot(a.x - b.x, a.y - b.y)
+}
+
+private func distanceToSegment(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+    let ab = CGPoint(x: b.x - a.x, y: b.y - a.y)
+    let len2 = ab.x * ab.x + ab.y * ab.y
+    guard len2 > 0 else { return distance(p, a) }
+    let t = min(max(((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2, 0), 1)
+    return distance(p, CGPoint(x: a.x + ab.x * t, y: a.y + ab.y * t))
+}
+@ The overlay is a [[Canvas]] the size of the image, so normalized coordinates become points by a
+single multiplication. The line has to be visible on any image, light or dark. So it is drawn
+twice: a wide dark stroke with a thin yellow stroke on top. The two handles differ on purpose. The
+filled one is the start, position $0$ on the profile's horizontal axis, and the hollow one is the
+end. Without that, a profile read from right to left would be easy to misread.
+
+<<ImageCanvas.swift: the line overlay>>=
+/// Draws the selection line: a filled handle at the start (position 0) and a hollow one at the end.
+private struct LineOverlay: View {
+    let line: LineSegment
+
+    var body: some View {
+        Canvas { ctx, size in
+            let a = CGPoint(x: line.start.x * size.width, y: line.start.y * size.height)
+            let b = CGPoint(x: line.end.x * size.width, y: line.end.y * size.height)
+            var path = Path()
+            path.move(to: a)
+            path.addLine(to: b)
+            ctx.stroke(path, with: .color(.black.opacity(0.7)), lineWidth: 3)
+            ctx.stroke(path, with: .color(.yellow), lineWidth: 1.25)
+
+            let r: CGFloat = 5
+            let startDot = Path(ellipseIn: CGRect(x: a.x - r, y: a.y - r, width: 2 * r, height: 2 * r))
+            ctx.fill(startDot, with: .color(.yellow))
+            ctx.stroke(startDot, with: .color(.black.opacity(0.7)), lineWidth: 1)
+            let endDot = Path(ellipseIn: CGRect(x: b.x - r, y: b.y - r, width: 2 * r, height: 2 * r))
+            ctx.fill(endDot, with: .color(.black.opacity(0.35)))
+            ctx.stroke(endDot, with: .color(.yellow), lineWidth: 1.5)
+        }
+    }
+}
+@
+
+\section{Charts}
+
+Both charts use Swift Charts' vectorized [[LinePlot]], which draws thousands of points quickly
+enough to follow a drag. Each chart computes its data in [[body]], from the session. Because the
+session is observable, any change to the line, the channel or the spectrum settings redraws the
+chart.
+
+<<LineScope/Views/Charts.swift>>=
+import Charts
+import LineScopeCore
+import SwiftUI
+
+<<Charts.swift: the profile chart>>
+
+<<Charts.swift: the spectrum chart>>
+@ The profile's horizontal axis is the position along the line, from $0$ at the start handle to $1$
+at the end. The number of samples depends on the variant: an image at half size gives half as many
+samples along the same line. So the axis label reports the count. Using normalized position lets
+profiles of differently sized copies line up side by side.
+
+The vertical axis is \emph{fixed} to the channel's natural range: $[0,1]$ for most channels, and
+$[0,360]$ degrees for hue. If each chart chose its own range, a faint ripple and a full-contrast
+square wave would look alike. With a shared, fixed domain, the charts of different variants can be
+compared by eye.
+
+<<Charts.swift: the profile chart>>=
+/// Zone 2: the selected channel sampled along the line in this variant's own pixel grid.
+struct ProfileChart: View {
+    let variant: ImageVariant
+    let session: Session
+
+    var body: some View {
+        let profile = session.profile(for: variant)
+        let channel = session.channelName
+        Chart {
+            LinePlot(profile.points, x: .value("Position", \.x), y: .value(channel, \.y))
+                .foregroundStyle(channelColor)
+                .lineStyle(StrokeStyle(lineWidth: 1.2))
+        }
+        .chartXScale(domain: 0...1)
+        .chartYScale(domain: session.colorModel.range(ofChannel: session.channelIndex))
+        .chartXAxisLabel("Position along line (\(profile.samples.colors.count) samples)")
+        .chartYAxisLabel(channel)
+        .padding(10)
+    }
+
+    <<ProfileChart: a color for each channel>>
+}
+@ The curve takes the color of its channel, so a glance tells which channel is plotted. Channels
+without a natural hue (alpha, lightness, black) use the primary text color.
+
+<<ProfileChart: a color for each channel>>=
+private var channelColor: Color {
+    switch (session.colorModel, session.channelIndex) {
+    case (.rgba, 0): .red
+    case (.rgba, 1): .green
+    case (.rgba, 2): .blue
+    case (.cmyk, 0): .cyan
+    case (.cmyk, 1): .pink
+    case (.cmyk, 2): .yellow
+    case (.hsl, 0): .purple
+    case (.hsl, 1): .orange
+    default: .primary
+    }
+}
+@ The spectrum chart transforms the same profile. Its horizontal axis ends at the Nyquist
+frequency, the highest frequency the samples can represent, and a dashed rule marks it. In
+cycles per pixel, Nyquist is about $\frac12$ for every variant, since the samples are about one
+pixel apart. In cycles per line it is half the number of samples, so it moves: a copy at half size
+has its Nyquist limit at half the frequency. Energy that the original has above that limit either
+disappears (a good low-pass filter) or folds back below it (aliasing). The rule shows at once which
+side of the limit a feature is on.
+
+<<Charts.swift: the spectrum chart>>=
+/// Zone 3: amplitude spectrum of the zone-2 profile.
+struct SpectrumChart: View {
+    let variant: ImageVariant
+    let session: Session
+
+    var body: some View {
+        let profile = session.profile(for: variant)
+        let spectrum = session.spectrum(for: profile)
+        let points = session.spectrumPoints(spectrum)
+        let nyquist = nyquist(spectrum)
+        Chart {
+            LinePlot(points, x: .value("Frequency", \.frequency), y: .value("Amplitude", \.magnitude))
+                .foregroundStyle(Color.accentColor)
+                .lineStyle(StrokeStyle(lineWidth: 1.2))
+            if let nyquist {
+                RuleMark(x: .value("Nyquist", nyquist))
+                    .foregroundStyle(.secondary)
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .annotation(position: .leading, alignment: .top) {
+                        Text("Nyquist").font(.caption2).foregroundStyle(.secondary)
+                    }
+            }
+        }
+        .chartXScale(domain: 0...max(nyquist ?? 0.5, 1e-9))
+        .chartYScale(domain: yDomain(points))
+        .chartXAxisLabel("Frequency (\(session.frequencyAxis.displayName)), FFT size \(spectrum.fftSize)")
+        .chartYAxisLabel(session.logMagnitude ? "Amplitude (dB)" : "Amplitude")
+        .padding(10)
+    }
+
+    <<SpectrumChart: the Nyquist frequency on the current axis>>
+
+    <<SpectrumChart: the amplitude range>>
+}
+@ The last bin of the one-sided spectrum is the Nyquist bin, so its frequency, in whichever unit the
+axis uses, is the limit. An empty spectrum (a line too short to sample) has no limit.
+
+<<SpectrumChart: the Nyquist frequency on the current axis>>=
+private func nyquist(_ s: SpectrumResult) -> Double? {
+    guard s.fftSize > 0 else { return nil }
+    switch session.frequencyAxis {
+    case .cyclesPerPixel: return s.cyclesPerPixel.last
+    case .cyclesPerLine: return s.cyclesPerLine.last
+    }
+}
+@ In decibels, the vertical range is fixed at the bottom at $-100$\,dB, the floor to which the
+session clips tiny amplitudes. The top is the next multiple of 10\,dB above the peak (at least 0),
+so charts of different variants mostly share one scale. On the linear scale the peak sets the
+range, with 5\% of headroom.
+
+<<SpectrumChart: the amplitude range>>=
+private func yDomain(_ points: [SpectrumPoint]) -> ClosedRange<Double> {
+    let top = points.map(\.magnitude).max() ?? 1
+    if session.logMagnitude {
+        return -100...max(0, (top / 10).rounded(.up) * 10)
+    }
+    return 0...max(top * 1.05, 1e-6)
+}
+@
+
+\section{The parameter sheet}\label{sec:parameter-sheet}
+
+Operations that take parameters (the blurs, sharpening, noise reduction and every resampling
+method) ask for them in a sheet before running. The menu only sets the session's
+[[pendingRequest]]; the window presents this sheet for it; and Apply hands a finished
+[[ImageOperation]] to the session, which runs it on the focused variant in the background.
+
+<<LineScope/Views/ParameterSheet.swift>>=
+import LineScopeCore
+import SwiftUI
+
+/// Collects parameters for a filter or resample, then runs it on the focused variant.
+struct ParameterSheet: View {
+    let request: OperationRequest
+    let session: Session
+    @Environment(\.dismiss) private var dismiss
+
+    <<ParameterSheet: parameters and their defaults>>
+
+    <<ParameterSheet: layout>>
+
+    <<ParameterSheet: fields for each request>>
+
+    <<ParameterSheet: a numeric field>>
+
+    <<ParameterSheet: validating a resample>>
+
+    <<ParameterSheet: building the operation>>
+}
+@ One sheet serves every request, so it simply holds all the parameters any of them might need,
+with defaults that give a visible but moderate effect. A scale of $0.5$ is the most instructive
+default for resampling: halving an image is where aliasing first shows.
+
+<<ParameterSheet: parameters and their defaults>>=
+@State private var radius = 2.0
+@State private var intensity = 0.5
+@State private var noiseLevel = 0.02
+@State private var sharpness = 0.4
+@State private var scale = 0.5
+
+private static let maxOutputSide = 16_384
+@ The sheet names the variant it will act on. Operations chain, so the source is often not the
+original, and the user should be able to see which variant it is. Return applies and Escape cancels.
+
+<<ParameterSheet: layout>>=
+var body: some View {
+    let source = session.focusedVariant
+    VStack(alignment: .leading, spacing: 14) {
+        Text(request.title).font(.headline)
+        Text("Applies to: \(source.name) (\(source.buffer.width)×\(source.buffer.height))")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+        Form { fields(source: source) }
+
+        HStack {
+            Spacer()
+            Button("Cancel", role: .cancel) { dismiss() }
+                .keyboardShortcut(.cancelAction)
+            Button("Apply") {
+                session.perform(operation)
+                dismiss()
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(!isValid(source: source))
+        }
+    }
+    .padding(20)
+    .frame(width: 380)
+}
+@ Each request shows only its own fields. For resampling, the sheet shows the resulting size as the
+scale is typed, computed with the same rounding the resampler will use
+([[Resampler.outputSize]]). What the user sees is exactly what the operation will produce.
+
+<<ParameterSheet: fields for each request>>=
+@ViewBuilder
+private func fields(source: ImageVariant) -> some View {
+    switch request {
+    case .gaussianBlur, .boxBlur:
+        number("Radius (px)", $radius, range: 0...100)
+    case .unsharpMask:
+        number("Radius (px)", $radius, range: 0...100)
+        number("Intensity", $intensity, range: 0...10)
+    case .noiseReduction:
+        number("Noise level", $noiseLevel, range: 0...0.1)
+        number("Sharpness", $sharpness, range: 0...2)
+    case .resample:
+        LabeledContent("Scale factor") {
+            HStack {
+                TextField("Scale", value: $scale, format: .number.precision(.fractionLength(0...4)))
+                    .frame(width: 80)
+                Menu("Presets") {
+                    ForEach([0.25, 0.5, 0.75, 1.5, 2, 4], id: \.self) { s in
+                        Button("×\(s.formatted())") { scale = s }
+                    }
+                }
+                .fixedSize()
+            }
+        }
+        LabeledContent("Result") {
+            Text("\(Resampler.outputSize(for: source.buffer.width, scale: scale)) × \(Resampler.outputSize(for: source.buffer.height, scale: scale)) px")
+                .monospacedDigit()
+        }
+    }
+}
+@ A numeric parameter is a slider for exploring together with a text field for exact values.
+Both are bound to the same state.
+
+<<ParameterSheet: a numeric field>>=
+private func number(_ label: String, _ value: Binding<Double>, range: ClosedRange<Double>) -> some View {
+    LabeledContent(label) {
+        HStack {
+            Slider(value: value, in: range)
+            TextField(label, value: value, format: .number.precision(.fractionLength(0...3)))
+                .frame(width: 60)
+                .labelsHidden()
+        }
+    }
+}
+@ Only resampling can be asked for something unreasonable: a zero or negative scale, or an output so
+large it would exhaust memory. With four [[Float]] components per pixel, a $16384\times16384$
+image already takes 4\,GiB, so that is the limit.
+
+<<ParameterSheet: validating a resample>>=
+private func isValid(source: ImageVariant) -> Bool {
+    guard case .resample = request else { return true }
+    let w = Resampler.outputSize(for: source.buffer.width, scale: scale)
+    let h = Resampler.outputSize(for: source.buffer.height, scale: scale)
+    return scale > 0 && max(w, h) <= Self.maxOutputSide
+}
+@ Finally the request and the collected values become an operation, a plain value that can run
+anywhere, record itself in a variant's lineage, and name the new tab.
+
+<<ParameterSheet: building the operation>>=
+private var operation: ImageOperation {
+    switch request {
+    case .gaussianBlur: .filter(.gaussianBlur(radius: radius))
+    case .boxBlur: .filter(.boxBlur(radius: radius))
+    case .unsharpMask: .filter(.unsharpMask(radius: radius, intensity: intensity))
+    case .noiseReduction: .filter(.noiseReduction(level: noiseLevel, sharpness: sharpness))
+    case .resample(let method): .resample(method, scale: scale)
+    }
+}
+@
+
+\section{The inspector}
+
+The inspector is a separate window that describes the focused variant of the most recently active
+document window. As explained with [[MainView]], it can't find that window through focused values.
+The inspector \emph{is} the key window while it is being read or scrolled, and then the focused
+value would be empty. It observes [[ActiveSession.shared]] instead, which document windows update
+when they become key.
+
+<<LineScope/Views/InspectorView.swift>>=
+import LineScopeCore
+import SwiftUI
+
+/// Separate window describing the focused variant of the most recently active document window.
+struct InspectorView: View {
+    static let windowID = "inspector"
+
+    private var active = ActiveSession.shared
+
+    var body: some View {
+        Group {
+            if let session = active.session {
+                InspectorContent(session: session)
+            } else {
+                ContentUnavailableView("No Image", systemImage: "photo", description: Text("Open an image to inspect it."))
+            }
+        }
+        .frame(minWidth: 300, idealWidth: 340, minHeight: 320, idealHeight: 760)
+    }
+}
+
+<<InspectorView.swift: the inspector's content>>
+@ The content is a grouped form of read-only rows. It computes the same profile and spectrum as the
+charts, so its numbers always agree with what the zones show.
+
+<<InspectorView.swift: the inspector's content>>=
+private struct InspectorContent: View {
+    let session: Session
+
+    var body: some View {
+        let variant = session.focusedVariant
+        let profile = session.profile(for: variant)
+        let spectrum = session.spectrum(for: profile)
+        let info = session.sourceInfo
+        let original = session.original.buffer
+
+        Form {
+            <<InspectorContent: the file section>>
+
+            <<InspectorContent: the focused-image section>>
+
+            <<InspectorContent: the operation-chain section>>
+
+            <<InspectorContent: the line section>>
+
+            <<InspectorContent: the channel-statistics section>>
+        }
+        .formStyle(.grouped)
+    }
+
+    <<InspectorContent: row and number helpers>>
+}
+@ The file section describes the image as it was stored, before it was converted to the float
+buffer all processing uses. A 16-bit or CMYK file shows that here, even though every variant is
+processed in the same format.
+
+<<InspectorContent: the file section>>=
+Section("File") {
+    row("Name", session.fileName)
+    row("Type", info.fileType)
+    row("Stored size", "\(info.pixelWidth) × \(info.pixelHeight) px")
+    row("Bit depth", "\(info.bitsPerComponent) bpc, \(info.bitsPerPixel) bpp")
+    row("Color space", info.colorSpaceName)
+    row("Alpha", info.hasAlpha ? "Yes" : "No")
+    if let dpi = info.dpi { row("Resolution", "\(num(dpi, 0)) dpi") }
+}
+@ For the focused variant, the scale is given separately for each axis. Rounding to whole pixels
+makes a nominal $\times0.5$ of an odd-sized image slightly different horizontally and vertically.
+
+<<InspectorContent: the focused-image section>>=
+Section("Focused Image") {
+    row("Tab", variant.name)
+    row("Size", "\(variant.buffer.width) × \(variant.buffer.height) px")
+    row(
+        "Scale vs. original",
+        "×\(num(Double(variant.buffer.width) / Double(original.width), 4)) · ×\(num(Double(variant.buffer.height) / Double(original.height), 4))"
+    )
+    row("Working format", "RGBA Float32, sRGB-encoded")
+}
+@ The operation chain lists, in order, every step from the original to this variant. This is the
+full history, even though each step was applied to whatever variant was focused at the time.
+
+<<InspectorContent: the operation-chain section>>=
+Section("Operation Chain") {
+    Text("Original").foregroundStyle(.secondary)
+    ForEach(Array(variant.lineage.enumerated()), id: \.offset) { i, op in
+        Text("\(i + 1). \(op.displayName)")
+    }
+}
+@ The line is shared in normalized coordinates, but here it is shown in \emph{this} variant's
+pixels. Its length, sample count and spacing follow, so you can see directly that a resampled
+copy is sampled more coarsely along the same line.
+
+<<InspectorContent: the line section>>=
+Section("Line") {
+    let w = Double(variant.buffer.width), h = Double(variant.buffer.height)
+    let l = session.line
+    row("Start", "(\(num(l.start.x * w, 1)), \(num(l.start.y * h, 1))) px")
+    row("End", "(\(num(l.end.x * w, 1)), \(num(l.end.y * h, 1))) px")
+    row("Length", "\(num(profile.samples.pixelLength, 1)) px")
+    row("Samples", "\(profile.values.count), spacing \(num(profile.samples.spacing, 3)) px")
+}
+@ Last come summary statistics of the profile and the strongest frequency in its spectrum, given in
+both units of the frequency axis. With the mean removed, that peak is the dominant periodicity
+along the line: for a grating, its frequency.
+
+<<InspectorContent: the channel-statistics section>>=
+Section("\(session.colorModel.displayName) · \(session.channelName)") {
+    let v = profile.values
+    row("Min", num(Double(v.min() ?? 0), 4))
+    row("Max", num(Double(v.max() ?? 0), 4))
+    row("Mean", num(Double(v.reduce(0, +)) / Double(max(v.count, 1)), 4))
+    if let k = spectrum.peakIndex {
+        row("Peak frequency", "\(num(spectrum.cyclesPerPixel[k], 4)) c/px · \(num(spectrum.cyclesPerLine[k], 2)) c/line")
+        row("Peak amplitude", num(spectrum.amplitudes[k], 4))
+    }
+}
+@ Values are selectable so they can be copied, and numbers are formatted with a fixed number of
+decimals in the user's locale.
+
+<<InspectorContent: row and number helpers>>=
+private func row(_ label: String, _ value: String) -> some View {
+    LabeledContent(label) {
+        Text(value).textSelection(.enabled).multilineTextAlignment(.trailing)
+    }
+}
+
+private func num(_ v: Double, _ digits: Int) -> String {
+    v.formatted(.number.precision(.fractionLength(digits)))
+}
+@
+
+\section{Test-pattern windows}
+
+A generated test pattern (Chapter~\ref{ch:patterns}) is shown in exactly the same analysis window
+as an image file. It is only a different way of producing the [[ImageDocument]]. Two views are
+needed: the window for a pattern, and a generator window where a pattern is designed before it is
+created.
+
+<<LineScope/Views/TestPatternViews.swift>>=
+import LineScopeCore
+import SwiftUI
+
+<<TestPatternViews.swift: the pattern analysis window>>
+
+<<TestPatternViews.swift: the generator window>>
+@ A pattern window receives only the pattern's [[TestPatternSpec]], a small value that SwiftUI can
+store and restore with the window. The image must be generated from it, and that must happen
+\emph{once}. Doing it in [[init]] or [[body]] would regenerate a possibly large image on every
+redraw, and a fresh document would also mean a fresh session, losing all derived variants. So the
+document lives in [[@State]] and is filled by a task keyed on the spec, which runs once when the
+window appears. The generation itself runs detached, off the main thread, while a progress
+indicator holds the window's place.
+
+<<TestPatternViews.swift: the pattern analysis window>>=
+/// Analysis window for a generated pattern. Generation runs once per window, not on every view update.
+struct PatternWindow: View {
+    let spec: TestPatternSpec
+    @State private var document: ImageDocument?
+
+    var body: some View {
+        Group {
+            if let document {
+                MainView(document: document, fileName: spec.title)
+            } else {
+                ProgressView("Generating \(spec.kind.displayName)…")
+                    .frame(minWidth: 720, minHeight: 560)
+            }
+        }
+        .navigationTitle(spec.title)
+        .task(id: spec) {
+            let spec = spec
+            document = await Task.detached(priority: .userInitiated) { ImageDocument(pattern: spec) }.value
+        }
+    }
+}
+@ The generator window edits a spec: the kind of pattern, its size, and its one parameter. It shows
+a live preview, and Create opens a pattern window for it.
+
+<<TestPatternViews.swift: the generator window>>=
+/// Window for choosing a pattern, its size and parameter before creating it.
+struct TestPatternGeneratorView: View {
+    static let windowID = "pattern-generator"
+
+    @Environment(\.openWindow) private var openWindow
+    @State private var spec = TestPatternSpec(kind: .zonePlate)
+    @State private var preview: CGImage?
+
+    private static let sizes = [128, 256, 512, 1024, 2048]
+    private static let maxSide = 8192
+    private static let maxPreviewPixels = 2048 * 2048
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 20) {
+            Form {
+                <<Generator window: pattern picker and description>>
+
+                <<Generator window: size fields>>
+
+                <<Generator window: parameter field>>
+
+                <<Generator window: the create button>>
+            }
+            .formStyle(.grouped)
+            .frame(width: 380)
+
+            previewView
+        }
+        .padding(16)
+        .task(id: spec) {
+            <<Generator window: rendering the preview>>
+        }
+    }
+
+    <<Generator window: the preview box>>
+
+    <<Generator window: changing the pattern kind>>
+
+    <<Generator window: validation and clamping>>
+}
+@ Each kind of pattern carries a sentence on what it is good for. Showing that under the picker
+turns the list into a small catalogue of test targets.
+
+<<Generator window: pattern picker and description>>=
+Picker("Pattern", selection: kindBinding) {
+    ForEach(TestPatternKind.allCases) { Text($0.displayName).tag($0) }
+}
+Text(spec.kind.purpose)
+    .font(.caption)
+    .foregroundStyle(.secondary)
+    .fixedSize(horizontal: false, vertical: true)
+@ The size is typed or picked from square presets. Grouping separators are turned off, so a width
+reads $2048$ and not $2{,}048$.
+
+<<Generator window: size fields>>=
+LabeledContent("Size") {
+    HStack {
+        TextField("Width", value: $spec.width, format: .number.grouping(.never))
+            .frame(width: 64)
+        Text("×")
+        TextField("Height", value: $spec.height, format: .number.grouping(.never))
+            .frame(width: 64)
+        Menu("Presets") {
+            ForEach(Self.sizes, id: \.self) { s in
+                Button("\(s) × \(s)") { spec.width = s; spec.height = s }
+            }
+        }
+        .fixedSize()
+    }
+    .labelsHidden()
+}
+@ The parameter's name and range come from the pattern kind itself. Kinds without a parameter show
+nothing. The noise seed gets no slider: neighboring seeds are unrelated, so dragging through them
+means nothing.
+
+<<Generator window: parameter field>>=
+if let p = spec.kind.parameter {
+    LabeledContent(p.name) {
+        HStack {
+            if spec.kind != .whiteNoise {
+                Slider(value: $spec.parameter, in: p.range)
+            }
+            TextField(p.name, value: $spec.parameter, format: .number.precision(.fractionLength(0...4)))
+                .frame(width: 70)
+                .labelsHidden()
+        }
+    }
+}
+@ Create opens a new pattern window \emph{by value}. SwiftUI finds the window group for
+[[TestPatternSpec]], and creating the same spec twice brings the existing window forward instead
+of opening a duplicate. A typed parameter can lie outside the slider's range, so it is clamped
+first.
+
+<<Generator window: the create button>>=
+HStack {
+    Spacer()
+    Button("Create") { openWindow(value: clamped(spec)) }
+        .keyboardShortcut(.defaultAction)
+        .disabled(!isValid)
+}
+@ The preview must show what the pattern will really look like. Generating a small version of the
+pattern would be wrong: a zone plate made at $256\times256$ is a different image from the center of
+one made at $1024\times1024$, with different frequencies and different aliasing. So the preview
+generates the full pattern and crops its central $256\times256$ pixels, which are shown at 1:1.
+Huge patterns are not previewed at all.
+
+The task is keyed on the spec, so SwiftUI cancels it whenever the spec changes. The short sleep
+debounces typing and slider drags: only a spec that stays unchanged for 80\,ms is rendered.
+
+<<Generator window: rendering the preview>>=
+guard isValid, spec.width * spec.height <= Self.maxPreviewPixels else { preview = nil; return }
+// Generate the real pattern and show its central pixels at 1:1, so aliasing looks as it will
+// in the analysis window.
+let s = clamped(spec)
+try? await Task.sleep(for: .milliseconds(80))
+guard !Task.isCancelled else { return }
+preview = await Task.detached {
+    guard let full = TestPatternGenerator.make(s).makeCGImage() else { return nil }
+    let w = min(s.width, 256), h = min(s.height, 256)
+    let rect = CGRect(x: (s.width - w) / 2, y: (s.height - h) / 2, width: w, height: h)
+    return full.cropping(to: rect)
+}.value
+@ The preview box always has the same size, so the window doesn't jump as specs change. As in the
+image canvas, interpolation is off: a preview pixel is an image pixel.
+
+<<Generator window: the preview box>>=
+private var previewView: some View {
+    VStack(spacing: 6) {
+        Group {
+            if let preview {
+                Image(decorative: preview, scale: 1).interpolation(.none)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: 256, height: 256)
+        .background(Color(nsColor: .underPageBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        Text(spec.width * spec.height <= Self.maxPreviewPixels
+             ? "Preview: center 256 × 256 px at 1:1" : "Too large to preview")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+}
+@ Parameters mean different things for different patterns: a frequency in cycles per pixel for a
+chirp, a period in pixels for bars, a number of spokes for the star. Carrying the value over when
+the kind changes would produce nonsense, such as a checkerboard with cells $0.5$ pixels wide. So
+the custom binding rebuilds the spec, keeping the size and taking the new kind's default parameter.
+
+<<Generator window: changing the pattern kind>>=
+/// Resets the parameter to the new pattern's default when the kind changes.
+private var kindBinding: Binding<TestPatternKind> {
+    Binding(
+        get: { spec.kind },
+        set: { spec = TestPatternSpec(kind: $0, width: spec.width, height: spec.height) }
+    )
+}
+@ Sizes are limited to 8192 pixels per side, and the parameter is limited to its kind's range.
+
+<<Generator window: validation and clamping>>=
+private var isValid: Bool {
+    (1...Self.maxSide).contains(spec.width) && (1...Self.maxSide).contains(spec.height)
+}
+
+private func clamped(_ s: TestPatternSpec) -> TestPatternSpec {
+    var s = s
+    if let p = s.kind.parameter {
+        s.parameter = min(max(s.parameter, p.range.lowerBound), p.range.upperBound)
+    }
+    return s
+}
+@

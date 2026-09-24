@@ -1,0 +1,459 @@
+\chapter{Resampling}\label{ch:resampling}
+
+Resampling changes the size of an image. It is the operation LineScope was written to study, so
+its implementation puts clarity and exactness first. Each menu entry is \emph{exactly} the
+textbook algorithm it names. Library routines (vImage, Core Image) choose their own kernels,
+prefilters and edge rules, and that would blur the comparison the user is trying to make.
+
+\section{Theory in brief}
+
+A digital image is a set of samples of a continuous picture. To resample it to a new grid we
+(conceptually) reconstruct the continuous picture by convolving the samples with a
+\emph{kernel} $k$, then sample the result at the new positions. In one dimension, output pixel
+$i$ at position $u_i$ in input coordinates is
+\[
+  \mathrm{out}_i = \frac{\sum_j k(j + \tfrac12 - u_i)\,\mathrm{in}_j}{\sum_j k(j + \tfrac12 - u_i)} .
+\]
+The denominator renormalizes the weights, so a constant image stays constant even where the
+kernel is cut off at the image border.
+
+\paragraph{Pixel centers.} Input pixel $j$ covers the interval $[j, j+1)$ and has its center at
+$j + \frac12$. With scale $s = n_{\mathrm{out}}/n_{\mathrm{in}}$, output pixel $i$ covers
+$[i, i+1)$ in output coordinates, and its center maps back to
+\[
+  u_i = \frac{i + \frac12}{s}
+\]
+in input coordinates. This convention keeps the image centered: halving an image of width 4
+puts the two output centers at input positions 1 and 3, exactly between the input centers
+0.5, 1.5 and 2.5, 3.5. Using $u_i = i/s$ instead would shift the whole image by half a pixel,
+a classic bug that shows up as asymmetric profiles.
+
+\paragraph{Downscaling needs a prefilter.} When $s < 1$ the new grid cannot represent
+frequencies above its own Nyquist limit, $s/2$ cycles per input pixel. A reconstruction kernel of
+fixed width lets those frequencies through, and they fold back as aliases. The standard cure is
+to stretch the kernel by $1/s$, which turns it into a low-pass filter matched to the new grid:
+\[
+  k_s(x) = k(s\,x), \qquad \text{with support widened by } 1/s .
+\]
+The normalization above absorbs the factor $s$ that a properly scaled filter would carry.
+Nearest neighbor is kept \emph{without} this widening, so that the menu offers a method that
+aliases. Seeing aliasing is instructive.
+
+\paragraph{Separability.} All kernels here are applied separably, first along rows, then
+along columns: $k(x,y) = k(x)\,k(y)$. That turns an $O(r^2)$ cost per pixel into $O(r)$ and lets both
+passes share one routine for computing weights.
+
+\section{The methods}
+
+The file holds the list of methods, and the resampler that implements them.
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift>>=
+import Foundation
+
+<<Resampling: the [[ResampleMethod]] enumeration>>
+
+<<Resampling: the [[Resampler]] namespace>>
+@
+
+The enumeration is what the Resample menu iterates over. Each method has a long name for the menu
+and a short one for tab titles, where a chain like ``Tent $\times 2$ $\to$ Mitchell $\times 0.5$''
+must stay readable. [[CaseIterable]] lets the menu stay in sync with this list automatically.
+
+<<Resampling: the [[ResampleMethod]] enumeration>>=
+public enum ResampleMethod: String, CaseIterable, Identifiable, Sendable {
+    case nearest
+    case tent
+    case catmullRom
+    case mitchell
+    case lanczos3
+    case sinc
+    case area
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .nearest: "Nearest Neighbor"
+        case .tent: "Tent (Bilinear)"
+        case .catmullRom: "Catmull-Rom (Bicubic)"
+        case .mitchell: "Mitchell-Netravali"
+        case .lanczos3: "Lanczos-3"
+        case .sinc: "Sinc (truncated, r=\(Int(Resampler.sincRadius)))"
+        case .area: "Area Average"
+        }
+    }
+
+    public var shortName: String {
+        switch self {
+        case .nearest: "Nearest"
+        case .tent: "Tent"
+        case .catmullRom: "Catmull-Rom"
+        case .mitchell: "Mitchell"
+        case .lanczos3: "Lanczos"
+        case .sinc: "Sinc"
+        case .area: "Area"
+        }
+    }
+}
+@
+
+The resampler is a caseless enum, used only as a namespace. Its documentation comment summarizes
+the conventions just derived. The body goes from the public entry points down to the kernels.
+
+<<Resampling: the [[Resampler]] namespace>>=
+/// Separable resampling with explicit, textbook kernels.
+///
+/// Coordinates follow the pixel-center convention: input pixel `j` covers `[j, j+1)` and its center is `j + 0.5`.
+/// Output pixel `i` maps to input position `(i + 0.5) / scale`.
+/// - `nearest` picks one source pixel and does no prefiltering, so it aliases when downscaling.
+/// - The kernel methods (tent, Catmull-Rom, Mitchell, Lanczos, sinc) widen their kernel by `1/scale`
+///   when downscaling (antialiased).
+/// - `area` weights source pixels by how much of the output pixel's footprint they cover.
+public enum Resampler {
+    <<Resampler: sinc radius and output size>>
+
+    <<Resampler: resampling by a scale factor>>
+
+    <<Resampler: resampling to a given size>>
+
+    // MARK: - Kernels
+
+    <<Resampler: contributions of input pixels>>
+
+    <<Resampler: trimming and normalizing weights>>
+
+    <<Resampler: kernel supports>>
+
+    <<Resampler: the sinc function>>
+
+    <<Resampler: the BC-spline family>>
+
+    <<Resampler: kernel evaluation>>
+}
+@
+
+\section{Entry points}
+
+A scale factor becomes an output size by rounding, never below one pixel. The parameter sheet uses
+the same function to preview the resulting size, so what the user is promised is what they get.
+The radius of the truncated sinc kernel is a public constant for the same reason: the menu title
+shows it.
+
+<<Resampler: sinc radius and output size>>=
+/// Half-width of the truncated sinc kernel, in source pixels (before widening).
+public static let sincRadius = 8.0
+
+public static func outputSize(for size: Int, scale: Double) -> Int {
+    max(1, Int((Double(size) * scale).rounded()))
+}
+@
+
+<<Resampler: resampling by a scale factor>>=
+public static func resample(_ src: PixelBuffer, scale: Double, method: ResampleMethod) -> PixelBuffer {
+    resample(
+        src,
+        width: outputSize(for: src.width, scale: scale),
+        height: outputSize(for: src.height, scale: scale),
+        method: method
+    )
+}
+@
+
+Resampling to a given size first premultiplies the source (Section~\ref{sec:premultiply}), so that
+transparent pixels don't leak their color. It then computes one table of weights per axis, runs the
+two passes, and converts the result back to straight alpha. Note that the scale in each direction is
+derived from the rounded sizes, not from the requested factor, so the image maps exactly onto the
+new grid.
+
+<<Resampler: resampling to a given size>>=
+public static func resample(_ src: PixelBuffer, width: Int, height: Int, method: ResampleMethod) -> PixelBuffer {
+    let premul = src.premultiplied()
+    let xContrib = contributions(inSize: src.width, outSize: width, method: method)
+    let yContrib = contributions(inSize: src.height, outSize: height, method: method)
+
+    <<Resampler: horizontal pass>>
+
+    <<Resampler: vertical pass>>
+
+    return PixelBuffer.fromPremultiplied(width: width, height: height, out)
+}
+@
+
+\subsection{The two passes}
+
+The horizontal pass changes only the width. For every row and every output column it takes the
+weighted sum of a short run of consecutive input pixels, the run described by that column's
+[[Contribution]]. The loops use unsafe buffer pointers: this is the one place where bounds
+checks on every access would noticeably slow the program down, and the contribution tables
+guarantee the indices are in range.
+
+<<Resampler: horizontal pass>>=
+// Horizontal pass: (src.width x src.height) -> (width x src.height)
+var tmp = [Float](repeating: 0, count: width * src.height * 4)
+premul.withUnsafeBufferPointer { s in
+    tmp.withUnsafeMutableBufferPointer { t in
+        for y in 0..<src.height {
+            let srcRow = y * src.width * 4
+            let dstRow = y * width * 4
+            for x in 0..<width {
+                let c = xContrib[x]
+                var r: Float = 0, g: Float = 0, b: Float = 0, a: Float = 0
+                for k in 0..<c.weights.count {
+                    let w = c.weights[k]
+                    let si = srcRow + (c.start + k) * 4
+                    r += s[si] * w
+                    g += s[si + 1] * w
+                    b += s[si + 2] * w
+                    a += s[si + 3] * w
+                }
+                let di = dstRow + x * 4
+                t[di] = r
+                t[di + 1] = g
+                t[di + 2] = b
+                t[di + 3] = a
+            }
+        }
+    }
+}
+@
+
+The vertical pass works on the intermediate image. Instead of gathering a column pixel by pixel,
+which would jump through memory, it accumulates whole input rows into each output row: every
+weight multiplies a contiguous run of $4W$ floats. The inner loop then runs over consecutive memory,
+which the compiler vectorizes.
+
+<<Resampler: vertical pass>>=
+// Vertical pass: (width x src.height) -> (width x height)
+var out = [Float](repeating: 0, count: width * height * 4)
+tmp.withUnsafeBufferPointer { t in
+    out.withUnsafeMutableBufferPointer { o in
+        let rowStride = width * 4
+        for y in 0..<height {
+            let c = yContrib[y]
+            let dstRow = y * rowStride
+            for k in 0..<c.weights.count {
+                let w = c.weights[k]
+                let srcRow = (c.start + k) * rowStride
+                for i in 0..<rowStride {
+                    o[dstRow + i] += t[srcRow + i] * w
+                }
+            }
+        }
+    }
+}
+@
+
+\section{Weights}
+
+A [[Contribution]] says which input pixels feed one output pixel: a first index and a list of
+weights for consecutive pixels. The weights are computed once per output column (or row) and
+reused for every row (or column), which is what makes separable resampling cheap.
+
+<<Resampler: contributions of input pixels>>=
+struct Contribution {
+    var start: Int
+    var weights: [Float]
+}
+
+static func contributions(inSize: Int, outSize: Int, method: ResampleMethod) -> [Contribution] {
+    let scale = Double(outSize) / Double(inSize)
+    var result: [Contribution] = []
+    result.reserveCapacity(outSize)
+
+    for i in 0..<outSize {
+        let center = (Double(i) + 0.5) / scale
+        switch method {
+        <<Resampler: nearest-neighbor contribution>>
+
+        <<Resampler: area-average contribution>>
+
+        <<Resampler: kernel contribution>>
+        }
+    }
+    return result
+}
+@
+
+Nearest neighbor takes the single input pixel whose interval contains $u_i$, that is
+$j = \lfloor u_i \rfloor$, clamped to the image. It uses no prefilter and no blending.
+
+<<Resampler: nearest-neighbor contribution>>=
+case .nearest:
+    let j = min(max(Int(center.rounded(.down)), 0), inSize - 1)
+    result.append(Contribution(start: j, weights: [1]))
+@
+
+Area averaging is the box filter done exactly. The output pixel's footprint, mapped back to
+input coordinates, is the interval $[u_i - \frac{1}{2s},\ u_i + \frac{1}{2s}]$. Each input pixel is
+weighted by the length of its overlap with the footprint,
+\[
+  w_j = \max\bigl(0,\ \min(\mathit{hi}, j+1) - \max(\mathit{lo}, j)\bigr),
+\]
+so for a factor of $\frac12$ the result is the plain mean of pixel pairs, and for non-integer
+factors the edge pixels count in proportion to how much of them is covered. When upscaling, the
+footprint is smaller than a pixel and the method degrades gracefully into nearest neighbor with
+blending at the seams.
+
+<<Resampler: area-average contribution>>=
+case .area:
+    // Output pixel footprint in input coordinates, exact coverage weights.
+    let half = 0.5 / scale
+    let lo = center - half
+    let hi = center + half
+    let first = max(0, Int(lo.rounded(.down)))
+    let last = min(inSize - 1, Int(hi.rounded(.up)) - 1)
+    var weights: [Float] = []
+    if last >= first {
+        for j in first...last {
+            let overlap = min(hi, Double(j + 1)) - max(lo, Double(j))
+            weights.append(Float(max(0, overlap)))
+        }
+    }
+    result.append(normalized(start: first, weights: weights, fallback: center, inSize: inSize))
+@
+
+All the true kernels share one path. The filter scale is $\max(1, 1/s)$: it is $1$ when upscaling,
+where the kernel only interpolates, and $1/s$ when downscaling, where it also prefilters. The support
+widens by the same factor, and each input pixel within it gets the weight
+$k\bigl((j + \frac12 - u_i)/\max(1, 1/s)\bigr)$.
+
+<<Resampler: kernel contribution>>=
+case .tent, .catmullRom, .mitchell, .lanczos3, .sinc:
+    let filterScale = max(1, 1 / scale)
+    let support = kernelSupport(method) * filterScale
+    let first = max(0, Int((center - support).rounded(.down)))
+    let last = min(inSize - 1, Int((center + support).rounded(.up)))
+    var weights: [Float] = []
+    if last >= first {
+        for j in first...last {
+            let x = (Double(j) + 0.5 - center) / filterScale
+            weights.append(Float(kernel(method, x)))
+        }
+    }
+    result.append(normalized(start: first, weights: weights, fallback: center, inSize: inSize))
+@
+
+Before a weight list is stored, zero weights at both ends are removed; the support bounds are
+conservative, and the trimmed list keeps the inner loops short. The weights are then divided by
+their sum. This is the renormalization in the formula at the start of the chapter: it keeps
+flat regions flat and handles the image border, where part of the kernel falls outside the image.
+
+If nothing is left, or the sum vanishes (possible in principle for kernels with negative lobes),
+the function falls back to nearest neighbor rather than dividing by zero.
+
+<<Resampler: trimming and normalizing weights>>=
+private static func normalized(start: Int, weights: [Float], fallback center: Double, inSize: Int) -> Contribution {
+    // Trim zero weights at both ends to keep inner loops short.
+    var first = 0
+    var last = weights.count - 1
+    while first <= last && weights[first] == 0 { first += 1 }
+    while last >= first && weights[last] == 0 { last -= 1 }
+    guard first <= last else {
+        let j = min(max(Int(center.rounded(.down)), 0), inSize - 1)
+        return Contribution(start: j, weights: [1])
+    }
+    let trimmed = Array(weights[first...last])
+    let sum = trimmed.reduce(0, +)
+    guard abs(sum) > 1e-12 else {
+        let j = min(max(Int(center.rounded(.down)), 0), inSize - 1)
+        return Contribution(start: j, weights: [1])
+    }
+    return Contribution(start: start + first, weights: trimmed.map { $0 / sum })
+}
+@
+
+\section{Kernels}
+
+Each kernel is an even function $k(x)$ that is zero outside a radius, its \emph{support}.
+
+<<Resampler: kernel supports>>=
+static func kernelSupport(_ method: ResampleMethod) -> Double {
+    switch method {
+    case .nearest, .area: 0.5
+    case .tent: 1
+    case .catmullRom, .mitchell: 2
+    case .lanczos3: 3
+    case .sinc: sincRadius
+    }
+}
+@
+
+\paragraph{Sinc.} The ideal reconstruction filter for band-limited signals is
+\[
+  \operatorname{sinc}(x) = \frac{\sin \pi x}{\pi x}, \qquad \operatorname{sinc}(0) = 1,
+\]
+whose Fourier transform is a perfect box: it passes every frequency below Nyquist unchanged and
+removes everything above. Its tails decay only like $1/x$, so it has to be truncated. LineScope
+truncates it at $|x| < 8$ with a rectangular window, which is the textbook ``sinc filter'' with
+its textbook flaw: the sharp cutoff produces visible ringing next to edges (the Gibbs
+phenomenon). The step-edge test pattern shows this clearly.
+
+<<Resampler: the sinc function>>=
+private static func sinc(_ x: Double) -> Double {
+    if abs(x) < 1e-9 { return 1 }
+    let px = Double.pi * x
+    return sin(px) / px
+}
+@
+
+\paragraph{The BC-splines.} Mitchell and Netravali~\cite{mitchell88} described a two-parameter
+family of cubic kernels with support 2 that contains most cubic filters in use:
+\[
+  k_{B,C}(x) = \frac16
+  \begin{cases}
+    (12 - 9B - 6C)|x|^3 + (-18 + 12B + 6C)|x|^2 + (6 - 2B), & |x| < 1,\\
+    (-B - 6C)|x|^3 + (6B + 30C)|x|^2 + (-12B - 48C)|x| + (8B + 24C), & 1 \le |x| < 2,\\
+    0, & \text{otherwise.}
+  \end{cases}
+\]
+The choice $B = 0$, $C = \frac12$ is the Catmull-Rom spline, which is Keys' cubic convolution
+kernel with $a = -\frac12$~\cite{keys81}. It interpolates ($k(0) = 1$, $k(\pm1) = k(\pm2) = 0$) and
+reproduces quadratics exactly, but it rings a little. Mitchell and Netravali chose
+$B = C = \frac13$ after a user study, trading a little blur for much less ringing and less
+anisotropy. That kernel does \emph{not} interpolate: $k(0) = \frac89$ and $k(\pm1) = \frac1{18}$,
+so even resampling at scale 1 smooths the image slightly. The tests check these values.
+
+<<Resampler: the BC-spline family>>=
+/// Mitchell-Netravali / Keys family: (B, C) = (1/3, 1/3) is Mitchell, (0, 1/2) is Catmull-Rom.
+private static func bcSpline(_ ax: Double, b: Double, c: Double) -> Double {
+    if ax < 1 {
+        return ((12 - 9 * b - 6 * c) * ax * ax * ax + (-18 + 12 * b + 6 * c) * ax * ax + (6 - 2 * b)) / 6
+    }
+    if ax < 2 {
+        return ((-b - 6 * c) * ax * ax * ax + (6 * b + 30 * c) * ax * ax
+            + (-12 * b - 48 * c) * ax + (8 * b + 24 * c)) / 6
+    }
+    return 0
+}
+@
+
+\paragraph{All kernels together.} The box, $k(x) = 1$ for $|x| < \frac12$, stands in for nearest
+neighbor and area averaging, although both have their own code paths above and never actually
+evaluate it. The \emph{tent}, $k(x) = \max(0, 1 - |x|)$, is linear interpolation; applied
+separably it is bilinear interpolation. \emph{Lanczos-3} tapers the sinc with a wider sinc as
+the window,
+\[
+  L_3(x) = \operatorname{sinc}(x)\,\operatorname{sinc}(x/3), \qquad |x| < 3,
+\]
+which keeps most of the sinc's sharpness and much less of its ringing.
+
+<<Resampler: kernel evaluation>>=
+static func kernel(_ method: ResampleMethod, _ x: Double) -> Double {
+    let ax = abs(x)
+    switch method {
+    case .nearest, .area:
+        return ax < 0.5 ? 1 : 0
+    case .tent:
+        return max(0, 1 - ax)
+    case .catmullRom:
+        return bcSpline(ax, b: 0, c: 0.5)
+    case .mitchell:
+        return bcSpline(ax, b: 1.0 / 3, c: 1.0 / 3)
+    case .lanczos3:
+        return ax < 3 ? sinc(ax) * sinc(ax / 3) : 0
+    case .sinc:
+        // Ideal low-pass, truncated (rectangular window): expect ringing near edges.
+        return ax < sincRadius ? sinc(ax) : 0
+    }
+}
+@

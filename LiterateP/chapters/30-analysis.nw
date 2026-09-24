@@ -1,0 +1,518 @@
+\chapter{Lines, Colors and Spectra}\label{ch:analysis}
+
+The analysis part of LineScope is a pipeline of three steps. The selection line is sampled in the
+pixel grid of one image; each sample is converted to the chosen color model and reduced to one
+channel; the resulting profile goes through a real FFT. This chapter follows that order: first the
+line and its sampler, then the color models, and last the spectrum.
+
+\section{The selection line}
+
+The line is shared by all the copies of an image, and the copies differ in size. So the line can't
+be stored in pixels. It is stored in \emph{normalized} coordinates instead, where $(0,0)$ is the
+top-left corner of the image and $(1,1)$ the bottom-right corner, whatever the size. A resampled
+copy only scales the image, so the same normalized line falls on the same content in every copy.
+Converting to the pixels of an image of size $W\times H$ is one multiplication per axis:
+$x = uW$ and $y = vH$.
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/LineSampler.swift>>=
+import Foundation
+
+<<LineSampler: normalized point>>
+
+<<LineSampler: line segment>>
+
+<<LineSampler: sample record>>
+
+<<LineSampler: sampler>>
+@ A normalized point is a plain pair of doubles. The views need to keep the point inside the
+image while it is dragged, so it can clamp itself to the unit square.
+
+<<LineSampler: normalized point>>=
+/// A point relative to the image extent: (0,0) is the top-left corner, (1,1) the bottom-right corner.
+public struct NormalizedPoint: Sendable, Hashable {
+    public var x: Double
+    public var y: Double
+
+    public init(x: Double, y: Double) {
+        self.x = x
+        self.y = y
+    }
+
+    public func clamped() -> NormalizedPoint {
+        NormalizedPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1))
+    }
+}
+@ The segment has a direction: position $0$ of the profile is at [[start]] and position $1$ at
+[[end]]. The initial line crosses the full width at mid-height. Its length depends on the image
+it is measured in. With $\Delta u = u_1-u_0$ and $\Delta v = v_1-v_0$,
+\[
+  L = \sqrt{(\Delta u\,W)^2 + (\Delta v\,H)^2}.
+\]
+A copy at half size therefore has a line half as long, in its own pixels.
+
+<<LineSampler: line segment>>=
+/// The selection line, in normalized coordinates so it lands on the same content in every resampled copy.
+public struct LineSegment: Sendable, Hashable {
+    public var start: NormalizedPoint
+    public var end: NormalizedPoint
+
+    public init(start: NormalizedPoint, end: NormalizedPoint) {
+        self.start = start
+        self.end = end
+    }
+
+    /// Full-width horizontal line at mid-height.
+    public static let initial = LineSegment(start: .init(x: 0, y: 0.5), end: .init(x: 1, y: 0.5))
+
+    public func pixelLength(width: Int, height: Int) -> Double {
+        let dx = (end.x - start.x) * Double(width)
+        let dy = (end.y - start.y) * Double(height)
+        return (dx * dx + dy * dy).squareRoot()
+    }
+}
+@ \section{Sampling along the line}
+
+The result of sampling keeps, for every sample, its position $t\in[0,1]$ along the line and its
+color. It also records the line length and the spacing between samples, both in pixels. The
+spectrum needs the spacing to express frequencies in cycles per pixel.
+
+<<LineSampler: sample record>>=
+public struct LineSamples: Sendable {
+    /// Position along the line, 0 at `start` and 1 at `end`.
+    public var positions: [Double]
+    public var colors: [RGBA]
+    /// Line length in the sampled image's pixels.
+    public var pixelLength: Double
+    /// Distance between consecutive samples, in pixels (≈ 1).
+    public var spacing: Double
+}
+@ The sampler has two parts: the walk along the segment, and the interpolation at one point.
+
+<<LineSampler: sampler>>=
+public enum LineSampler {
+    <<LineSampler: sample along the line>>
+
+    <<LineSampler: bilinear interpolation>>
+}
+@ How many samples should a line of length $L$ get? The choice matters more than it seems. If
+every copy got the same number of samples, a half-size copy would be sampled twice per pixel.
+Its profile would look as smooth as the original's, and the loss of detail from shrinking would
+be hidden. So LineScope samples each copy in its \emph{own} grid, about once per pixel:
+\[
+  n = \max\bigl(2,\ \lceil L\rceil + 1\bigr),
+  \qquad t_i = \frac{i}{n-1},\quad i = 0,\dots,n-1,
+\]
+so the spacing $L/(n-1)$ is at most one pixel, and very close to one for long lines. For the
+initial line of a $W$-pixel-wide image, $n = W+1$ and the spacing is exactly one pixel. At least
+two samples keep a degenerate line from dividing by zero.
+
+<<LineSampler: sample along the line>>=
+/// Samples the line in the buffer's own pixel grid: `ceil(length) + 1` bilinear samples,
+/// so a half-size copy yields about half as many samples.
+public static func sample(_ buffer: PixelBuffer, along line: LineSegment) -> LineSamples {
+    let w = Double(buffer.width)
+    let h = Double(buffer.height)
+    let length = line.pixelLength(width: buffer.width, height: buffer.height)
+    let count = max(2, Int(length.rounded(.up)) + 1)
+    let x0 = line.start.x * w, y0 = line.start.y * h
+    let x1 = line.end.x * w, y1 = line.end.y * h
+
+    var positions = [Double](repeating: 0, count: count)
+    var colors = [RGBA](repeating: RGBA(r: 0, g: 0, b: 0, a: 0), count: count)
+    for i in 0..<count {
+        let t = Double(i) / Double(count - 1)
+        positions[i] = t
+        colors[i] = bilinear(buffer, x: x0 + (x1 - x0) * t, y: y0 + (y1 - y0) * t)
+    }
+    return LineSamples(
+        positions: positions, colors: colors, pixelLength: length,
+        spacing: length / Double(count - 1)
+    )
+}
+@ The sample points fall between pixel centers, so the color there must be interpolated. The
+convention used throughout LineScope is that pixel $j$ covers $[j, j+1)$ and has its center at
+$j+\frac12$. So a continuous position $x$ lies between the centers of pixels
+$i=\lfloor x-\frac12\rfloor$ and $i+1$, at fraction $t_x = (x-\frac12)-i$, and the same holds
+for $y$. Bilinear interpolation mixes the four neighbors $a,b,e,f$ (top-left, top-right,
+bottom-left, bottom-right) in two steps:
+\[
+  \mathit{top} = a + (b-a)\,t_x,\qquad
+  \mathit{bottom} = e + (f-e)\,t_x,\qquad
+  c = \mathit{top} + (\mathit{bottom}-\mathit{top})\,t_y .
+\]
+Indices outside the image are clamped to the border. Near an edge this repeats the border pixel,
+which is also what the resampler does. Bilinear interpolation is deliberately simple: it is a
+measuring instrument, and it must not add ringing of its own to the profiles it measures.
+
+<<LineSampler: bilinear interpolation>>=
+/// Bilinear interpolation at a continuous position (pixel centers at +0.5), edges clamped.
+public static func bilinear(_ buffer: PixelBuffer, x: Double, y: Double) -> RGBA {
+    let fx = x - 0.5
+    let fy = y - 0.5
+    let ix = Int(fx.rounded(.down))
+    let iy = Int(fy.rounded(.down))
+    let tx = Float(fx - Double(ix))
+    let ty = Float(fy - Double(iy))
+    let x0 = min(max(ix, 0), buffer.width - 1)
+    let x1 = min(max(ix + 1, 0), buffer.width - 1)
+    let y0 = min(max(iy, 0), buffer.height - 1)
+    let y1 = min(max(iy + 1, 0), buffer.height - 1)
+
+    let d = buffer.data
+    func mix(_ c: Int) -> Float {
+        let a = d[(y0 * buffer.width + x0) * 4 + c]
+        let b = d[(y0 * buffer.width + x1) * 4 + c]
+        let e = d[(y1 * buffer.width + x0) * 4 + c]
+        let f = d[(y1 * buffer.width + x1) * 4 + c]
+        let top = a + (b - a) * tx
+        let bottom = e + (f - e) * tx
+        return top + (bottom - top) * ty
+    }
+    return RGBA(r: mix(0), g: mix(1), b: mix(2), a: mix(3))
+}
+@ \section{Color models}
+
+A profile is one number per sample. The user picks a color model and one of its channels, and
+every sample is converted to it. The conversions work on the sRGB-encoded values as stored, the
+same values the filters see (Chapter~\ref{ch:pixels}).
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift>>=
+import Foundation
+
+<<ColorSpaces: color model>>
+
+<<ColorSpaces: conversions>>
+@ A color model knows the names of its channels and the range in which to plot each of them.
+Hue is an angle in degrees; every other channel lies in $[0,1]$. Fixing the plot range, instead
+of fitting it to the data, is what makes two profiles comparable at a glance.
+
+<<ColorSpaces: color model>>=
+public enum ColorModel: String, CaseIterable, Identifiable, Sendable {
+    case rgba
+    case hsl
+    case cmyk
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .rgba: "RGBA"
+        case .hsl: "HSL"
+        case .cmyk: "CMYK"
+        }
+    }
+
+    public var channels: [String] {
+        switch self {
+        case .rgba: ["Red", "Green", "Blue", "Alpha"]
+        case .hsl: ["Hue", "Saturation", "Lightness"]
+        case .cmyk: ["Cyan", "Magenta", "Yellow", "Black"]
+        }
+    }
+
+    /// Plot range for a channel; hue is in degrees, everything else in 0...1.
+    public func range(ofChannel channel: Int) -> ClosedRange<Double> {
+        self == .hsl && channel == 0 ? 0...360 : 0...1
+    }
+}
+@ The conversions come in pairs, color model to RGB and back. Only the forward direction is used
+by the app; the inverses exist so that the tests can check round trips (Chapter~\ref{ch:tests}).
+
+<<ColorSpaces: conversions>>=
+public enum ColorConversion {
+    // MARK: HSL (hue in degrees)
+
+    <<ColorSpaces: RGB to HSL>>
+
+    <<ColorSpaces: HSL to RGB>>
+
+    // MARK: CMYK (naive device-independent conversion, K = 1 - max(R,G,B))
+
+    <<ColorSpaces: RGB to CMYK and back>>
+
+    // MARK: Channel extraction
+
+    <<ColorSpaces: channel extraction>>
+}
+@ \subsection{HSL}
+
+With $M=\max(R,G,B)$, $m=\min(R,G,B)$ and chroma $d = M-m$, the standard definitions are
+\[
+  L = \frac{M+m}{2},\qquad
+  S = \frac{d}{1-\lvert 2L-1\rvert},\qquad
+  H = 60^\circ\times\begin{cases}
+     \dfrac{G-B}{d} \bmod 6 & \text{if } M = R,\\[1ex]
+     \dfrac{B-R}{d} + 2 & \text{if } M = G,\\[1ex]
+     \dfrac{R-G}{d} + 4 & \text{if } M = B.
+  \end{cases}
+\]
+A gray has $d=0$. Its hue is undefined, and it is reported as $0$ with zero saturation. The
+remainder operation in Swift keeps the sign of its dividend, so a negative hue is brought back
+into $[0^\circ,360^\circ)$ at the end. The saturation is clamped because rounding can push it a
+hair outside $[0,1]$ when $L$ is close to $0$ or $1$.
+
+Hue is circular, so a profile across a red area can jump between $0^\circ$ and $360^\circ$. The
+spectrum then sees a sharp step that isn't really in the image. That's a property of hue itself,
+and it's worth remembering when reading hue spectra.
+
+<<ColorSpaces: RGB to HSL>>=
+public static func hsl(from c: RGBA) -> (h: Float, s: Float, l: Float) {
+    let maxV = max(c.r, c.g, c.b)
+    let minV = min(c.r, c.g, c.b)
+    let l = (maxV + minV) / 2
+    let d = maxV - minV
+    guard d > 1e-7 else { return (0, 0, l) }
+    let s = d / (1 - abs(2 * l - 1))
+    var h: Float
+    if maxV == c.r {
+        h = ((c.g - c.b) / d).truncatingRemainder(dividingBy: 6)
+    } else if maxV == c.g {
+        h = (c.b - c.r) / d + 2
+    } else {
+        h = (c.r - c.g) / d + 4
+    }
+    h *= 60
+    if h < 0 { h += 360 }
+    return (h, min(max(s, 0), 1), l)
+}
+@ The inverse builds the color from its chroma $C=(1-\lvert 2L-1\rvert)S$. With $H' = H/60^\circ$,
+the second-largest component is $X = C\,(1-\lvert H' \bmod 2 - 1\rvert)$. The sextant
+$\lfloor H'\rfloor$ decides which of $R,G,B$ receive $C$, $X$ and $0$. Finally the lightness
+offset $m = L - C/2$ is added to all three.
+
+<<ColorSpaces: HSL to RGB>>=
+public static func rgb(h: Float, s: Float, l: Float, alpha: Float = 1) -> RGBA {
+    let c = (1 - abs(2 * l - 1)) * s
+    let hp = h / 60
+    let x = c * (1 - abs(hp.truncatingRemainder(dividingBy: 2) - 1))
+    let (r, g, b): (Float, Float, Float)
+    switch hp {
+    case ..<1: (r, g, b) = (c, x, 0)
+    case ..<2: (r, g, b) = (x, c, 0)
+    case ..<3: (r, g, b) = (0, c, x)
+    case ..<4: (r, g, b) = (0, x, c)
+    case ..<5: (r, g, b) = (x, 0, c)
+    default: (r, g, b) = (c, 0, x)
+    }
+    let m = l - c / 2
+    return RGBA(r: r + m, g: g + m, b: b + m, a: alpha)
+}
+@ \subsection{CMYK}
+
+Real CMYK depends on inks and paper, and needs an ICC profile. LineScope uses the naive
+conversion instead, which is enough to see how a filter treats the ``amount of black'' or of one
+ink:
+\[
+  K = 1-\max(R,G,B),\qquad
+  C = \frac{1-R-K}{1-K},\quad M = \frac{1-G-K}{1-K},\quad Y = \frac{1-B-K}{1-K}.
+\]
+Pure black ($K=1$) would divide by zero, so it is returned as $(0,0,0,1)$. The inverse is
+$R=(1-C)(1-K)$, and likewise for $G$ and $B$.
+
+<<ColorSpaces: RGB to CMYK and back>>=
+public static func cmyk(from c: RGBA) -> (c: Float, m: Float, y: Float, k: Float) {
+    let k = 1 - max(c.r, c.g, c.b)
+    guard k < 1 - 1e-7 else { return (0, 0, 0, 1) }
+    let d = 1 - k
+    return ((1 - c.r - k) / d, (1 - c.g - k) / d, (1 - c.b - k) / d, k)
+}
+
+public static func rgb(c: Float, m: Float, y: Float, k: Float, alpha: Float = 1) -> RGBA {
+    RGBA(r: (1 - c) * (1 - k), g: (1 - m) * (1 - k), b: (1 - y) * (1 - k), a: alpha)
+}
+@ The session calls this once per sample: it converts the color and picks the channel by its
+index, in the order given by [[ColorModel.channels]].
+
+<<ColorSpaces: channel extraction>>=
+public static func value(of color: RGBA, model: ColorModel, channel: Int) -> Float {
+    switch model {
+    case .rgba:
+        return [color.r, color.g, color.b, color.a][channel]
+    case .hsl:
+        let v = hsl(from: color)
+        return [v.h, v.s, v.l][channel]
+    case .cmyk:
+        let v = cmyk(from: color)
+        return [v.c, v.m, v.y, v.k][channel]
+    }
+}
+@ \section{The spectrum}
+
+The last step turns a profile of $n$ samples into an amplitude spectrum. It uses the FFT of
+Apple's Accelerate framework (vDSP).
+
+<<Packages/LineScopeCore/Sources/LineScopeCore/Spectrum.swift>>=
+import Accelerate
+import Foundation
+
+<<Spectrum: window functions>>
+
+<<Spectrum: result>>
+
+<<Spectrum: analyzer>>
+@ The DFT treats its input as one period of a periodic signal. The two ends of a profile rarely
+match, so the implied periodic signal has a jump, and that jump leaks energy into every
+frequency. A window tapers the ends to zero and trades a little frequency resolution for much
+less leakage. LineScope offers no window (``rectangular'') and the Hann window~\cite{harris78},
+\[
+  w_i = \tfrac12 - \tfrac12\cos\frac{2\pi i}{n-1},\qquad i=0,\dots,n-1 .
+\]
+
+<<Spectrum: window functions>>=
+public enum WindowFunction: String, CaseIterable, Identifiable, Sendable {
+    case none
+    case hann
+
+    public var id: String { rawValue }
+    public var displayName: String { self == .none ? "Rectangular" : "Hann" }
+}
+@ The result gives each bin's amplitude and two frequency axes. \emph{Cycles per pixel} are
+measured in the grid of the sampled image, where the Nyquist limit is $\frac12$. \emph{Cycles
+per line} count whole periods over the length of the line. The same image content has the same
+cycles-per-line frequency in every copy, so that axis is the one for comparing an original with
+its resampled copies. On that axis, each copy's Nyquist limit sits at half its own sample count.
+
+The peak is searched among the non-DC bins. The mean usually dominates bin $0$ and is rarely
+what one wants to find.
+
+<<Spectrum: result>>=
+public struct SpectrumResult: Sendable {
+    /// Bin frequencies in cycles per pixel of the sampled image (Nyquist ≈ 0.5).
+    public var cyclesPerPixel: [Double]
+    /// Bin frequencies in cycles over the whole line; comparable across resampled copies.
+    public var cyclesPerLine: [Double]
+    /// Single-sided amplitude: a sine of amplitude A peaks at ≈ A.
+    public var amplitudes: [Double]
+    public var fftSize: Int
+    public var sampleCount: Int
+
+    public static let empty = SpectrumResult(cyclesPerPixel: [], cyclesPerLine: [], amplitudes: [], fftSize: 0, sampleCount: 0)
+
+    /// Index of the largest non-DC bin.
+    public var peakIndex: Int? {
+        guard amplitudes.count > 1 else { return nil }
+        return amplitudes.indices.dropFirst().max { amplitudes[$0] < amplitudes[$1] }
+    }
+}
+@ The analyzer is one function with five steps.
+
+<<Spectrum: analyzer>>=
+public enum SpectrumAnalyzer {
+    /// Real FFT of a profile, zero-padded to the next power of two.
+    /// - Parameter spacing: distance between samples, in pixels.
+    public static func compute(
+        _ values: [Float], spacing: Double, window: WindowFunction, removeMean: Bool
+    ) -> SpectrumResult {
+        <<Spectrum: choose the FFT size>>
+
+        <<Spectrum: condition the signal>>
+        <<Spectrum: zero-pad>>
+
+        <<Spectrum: packed real FFT>>
+
+        <<Spectrum: single-sided amplitudes>>
+
+        <<Spectrum: frequency axes>>
+    }
+}
+@ The radix-2 FFT of vDSP needs a power-of-two length $N=2^{\lceil\log_2 n\rceil}$. A profile
+with fewer than two samples has no spectrum.
+
+<<Spectrum: choose the FFT size>>=
+let n = values.count
+guard n >= 2 else { return .empty }
+let log2n = vDSP_Length(Int(ceil(log2(Double(n)))))
+let fftSize = 1 << Int(log2n)
+let half = fftSize / 2
+@ Removing the mean is optional. Without it, bin $0$ holds the average brightness, which in dB
+scale flattens everything else. The window is applied after the mean is removed, so it tapers the
+fluctuations and not the offset. Its sum $\sum w_i$ is kept for normalization: with no window it
+is simply $n$.
+
+<<Spectrum: condition the signal>>=
+var signal = values
+if removeMean {
+    let mean = vDSP.mean(signal)
+    signal = vDSP.add(-mean, signal)
+}
+var windowSum = Float(n)
+if window == .hann {
+    // Symmetric Hann over the n real samples.
+    var w = [Float](repeating: 0, count: n)
+    for i in 0..<n {
+        w[i] = 0.5 - 0.5 * cos(2 * Float.pi * Float(i) / Float(n - 1))
+    }
+    signal = vDSP.multiply(signal, w)
+    windowSum = vDSP.sum(w)
+}
+@ The $n$ conditioned samples are followed by $N-n$ zeros. Zero padding adds no information. It
+interpolates the spectrum more finely, so that peaks are drawn at about the right place.
+
+<<Spectrum: zero-pad>>=
+var padded = [Float](repeating: 0, count: fftSize)
+padded.replaceSubrange(0..<n, with: signal)
+@ vDSP computes a real FFT of length $N$ as a complex FFT of length $N/2$. First
+[[vDSP_ctoz]] reads the real array as $N/2$ complex numbers: even samples become real parts
+and odd samples imaginary parts, in split form. Then [[vDSP_fft_zrip]] transforms it in place.
+
+The output is \emph{packed}. For $1\le k<N/2$, [[real]][$k$] and [[imag]][$k$] hold
+$2\operatorname{Re}X_k$ and $2\operatorname{Im}X_k$. The two purely real bins that have no
+partner share the first slot: [[real]][0] holds $2X_0$ (the DC term) and [[imag]][0] holds
+$2X_{N/2}$ (the Nyquist term). The factor $2$ is vDSP's scaling convention for the forward real
+transform.
+
+<<Spectrum: packed real FFT>>=
+var real = [Float](repeating: 0, count: half)
+var imag = [Float](repeating: 0, count: half)
+guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else { return .empty }
+defer { vDSP_destroy_fftsetup(setup) }
+
+real.withUnsafeMutableBufferPointer { rp in
+    imag.withUnsafeMutableBufferPointer { ip in
+        var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+        padded.withUnsafeBytes { raw in
+            vDSP_ctoz(raw.bindMemory(to: DSPComplex.self).baseAddress!, 2, &split, 1, vDSP_Length(half))
+        }
+        vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+    }
+}
+@ The amplitudes are made \emph{single-sided} and normalized so they can be read as the
+amplitude of a sinusoid. A real signal $A\cos(2\pi f i+\varphi)$ puts $|X_k| = \frac{A}{2}\sum w_i$
+into bin $k$ and the same into its mirror bin $N-k$, which isn't stored. Therefore
+\[
+  A_k = \frac{2\,|X_k|}{\sum_i w_i}\quad(0<k<N/2),\qquad
+  A_0 = \frac{|X_0|}{\sum_i w_i},\qquad
+  A_{N/2} = \frac{|X_{N/2}|}{\sum_i w_i},
+\]
+since DC and Nyquist have no mirror. Dividing by the window sum rather than by $n$ corrects for
+the energy the window removed. With it, a sine of amplitude $1$ reads about $1$ with either
+window. The halving in the code undoes vDSP's factor $2$.
+
+<<Spectrum: single-sided amplitudes>>=
+// vDSP's packed output is scaled by 2; DC is in real[0] and Nyquist in imag[0].
+var amplitudes = [Double](repeating: 0, count: half + 1)
+let norm = Double(max(windowSum, 1e-12))
+amplitudes[0] = abs(Double(real[0]) / 2) / norm
+amplitudes[half] = abs(Double(imag[0]) / 2) / norm
+for k in 1..<max(half, 1) {
+    let re = Double(real[k]) / 2
+    let im = Double(imag[k]) / 2
+    amplitudes[k] = 2 * (re * re + im * im).squareRoot() / norm
+}
+@ Bin $k$ of an $N$-point transform of samples spaced $\delta$ pixels apart has frequency
+$k/(N\delta)$ cycles per pixel, which reaches $1/(2\delta)\approx\frac12$ at $k=N/2$. The line
+spans $(n-1)\delta$ pixels, so the same bin has $k(n-1)/N$ cycles per line.
+
+<<Spectrum: frequency axes>>=
+let lineLength = spacing * Double(n - 1)
+var cpp = [Double](repeating: 0, count: half + 1)
+var cpl = [Double](repeating: 0, count: half + 1)
+for k in 0...half {
+    cpp[k] = Double(k) / (Double(fftSize) * spacing)
+    cpl[k] = cpp[k] * lineLength
+}
+return SpectrumResult(
+    cyclesPerPixel: cpp, cyclesPerLine: cpl, amplitudes: amplitudes,
+    fftSize: fftSize, sampleCount: n
+)
+@

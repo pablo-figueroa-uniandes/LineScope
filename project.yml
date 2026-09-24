@@ -1,0 +1,36 @@
+name: LineScope
+options:
+  bundleIdPrefix: co.edu.uniandes
+  deploymentTarget:
+    macOS: "15.0"
+packages:
+  LineScopeCore:
+    path: Packages/LineScopeCore
+targets:
+  LineScope:
+    type: application
+    platform: macOS
+    sources: [LineScope]
+    dependencies:
+      - package: LineScopeCore
+    info:
+      path: LineScope/Info.plist
+      properties:
+        CFBundleDisplayName: LineScope
+        LSApplicationCategoryType: public.app-category.graphics-design
+        NSHumanReadableCopyright: ""
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Image
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.image]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.edu.uniandes.LineScope
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: NO
