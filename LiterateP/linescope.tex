@@ -2,7 +2,10 @@
 \documentclass[11pt,a4paper,openany]{book}
 
 \usepackage{fontspec}
-\setmonofont{Menlo}[Scale=MatchLowercase]
+% Menlo ships with macOS; elsewhere fall back to Consolas (Windows) or DejaVu Sans Mono.
+\IfFontExistsTF{Menlo}{\setmonofont{Menlo}[Scale=MatchLowercase]}{%
+  \IfFontExistsTF{Consolas}{\setmonofont{Consolas}[Scale=MatchLowercase]}{%
+    \setmonofont{DejaVu Sans Mono}[Scale=MatchLowercase]}}
 \usepackage[margin=2.4cm]{geometry}
 \usepackage{microtype}
 \setlength{\emergencystretch}{3em}
@@ -30,6 +33,22 @@
   },
   morekeywords=[2]{@main,@Observable,@MainActor,@State,@Bindable,@Environment,@FocusedValue,
     @Entry,@ViewBuilder,@testable,@escaping},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+% ---------------------------------------------------------------- C# for listings (the Windows port)
+\lstdefinelanguage{CSharp}{
+  morekeywords={
+    abstract,as,base,bool,break,byte,case,catch,char,checked,class,const,continue,decimal,default,
+    delegate,do,double,else,enum,event,explicit,extern,false,finally,fixed,float,for,foreach,goto,
+    if,implicit,in,int,interface,internal,is,lock,long,namespace,new,null,object,operator,out,
+    override,params,private,protected,public,readonly,ref,return,sbyte,sealed,short,sizeof,
+    stackalloc,static,string,struct,switch,this,throw,true,try,typeof,uint,ulong,unchecked,unsafe,
+    ushort,using,virtual,void,volatile,while,var,get,set,init,value,async,await,record,required,
+    with,when,where,yield,nameof,and,or,not,partial,global,dynamic
+  },
   sensitive=true,
   morecomment=[l]{//},
   morecomment=[s]{/*}{*/},
@@ -99,6 +118,10 @@
 \bibitem{harris78} Fredric J. Harris. On the Use of Windows for Harmonic Analysis with the Discrete Fourier Transform.
   \emph{Proceedings of the IEEE} 66(1):51--83, 1978.
 \bibitem{xcodegen} XcodeGen. \url{https://github.com/yonaskolb/XcodeGen}.
+\bibitem{cooley65} James W. Cooley and John W. Tukey. An Algorithm for the Machine Calculation of Complex
+  Fourier Series. \emph{Mathematics of Computation} 19(90):297--301, 1965.
+\bibitem{wpf} Microsoft. Windows Presentation Foundation and Windows Imaging Component documentation.
+  \url{https://learn.microsoft.com/dotnet/desktop/wpf/}.
 \end{thebibliography}
 \chapter*{Index of Chunks}
 \addcontentsline{toc}{chapter}{Index of Chunks}

@@ -1,0 +1,867 @@
+\chapter{Documents and the Session in C\#}\label{ch:win-model}
+
+This chapter is the counterpart of Chapter~\ref{ch:model}. Its three files have the same roles as
+there: the document decodes a file once into a [[PixelBuffer]] and a display image; the variant,
+zone and pane types describe what the window shows; and the [[Session]] holds all the state of one
+window and performs the operations. Most of the logic is unchanged. Three things are not. Decoding
+goes through WIC instead of ImageIO. SwiftUI's automatic observation is replaced by an explicit
+change event, which is the largest difference in the whole app. And the plumbing that found the
+right session for a menu shrinks, because on Windows every window has its own menus.
+
+\section{The image document}
+
+A macOS document was a value conforming to [[FileDocument]], created by the document group. On
+Windows there is no document framework to conform to, so [[ImageDocument]] is a plain immutable
+class with two factory methods, one for a file and one for a test pattern. The application object
+calls them on a background thread (Chapter~\ref{ch:win-overview}). Nor is there a
+[[fileWrapper]] to refuse: with no framework, there is no Save command to disable.
+
+<<Windows/LineScope.App/Model/ImageDocument.cs>>=
+using System.IO;
+using System.Text;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using LineScope.Core;
+
+namespace LineScope.App.Model;
+
+<<Win ImageDocument: source information>>
+
+/// <summary>
+/// Read-only image document. Pixels are decoded once (with WIC) into a <see cref="PixelBuffer"/>. EXIF orientation
+/// is ignored on purpose so analysis runs on the stored pixel grid. Images with an embedded ICC profile are
+/// converted to sRGB, as on macOS.
+/// </summary>
+public sealed class ImageDocument
+{
+    <<Win ImageDocument: stored data>>
+
+    <<Win ImageDocument: reading a file>>
+
+    <<Win ImageDocument: a generated test pattern>>
+
+    <<Win ImageDocument: converting to sRGB>>
+
+    <<Win ImageDocument: detecting alpha>>
+
+    <<Win ImageDocument: the ICC profile's name>>
+}
+
+<<Win ImageDocument: rendering a buffer>>
+@
+
+The facts about the source are the same as on macOS. A C\# \emph{positional record} declares them in
+one statement: the compiler generates the properties, a constructor and value equality.
+
+<<Win ImageDocument: source information>>=
+/// <summary>Facts about the file as decoded, before conversion to the working float buffer.</summary>
+public sealed record SourceInfo(
+    string FileType,
+    int PixelWidth,
+    int PixelHeight,
+    int BitsPerComponent,
+    int BitsPerPixel,
+    string ColorSpaceName,
+    bool HasAlpha,
+    double? Dpi);
+@
+
+The document holds the float buffer, a display bitmap and the facts. As on macOS, the display image is
+rendered \emph{from the buffer}, not taken from the decoder, so what the user sees is exactly what is
+analyzed. The constructor is private, so a document can only come from the two factories.
+
+<<Win ImageDocument: stored data>>=
+public PixelBuffer Buffer { get; }
+public BitmapSource DisplayImage { get; }
+public SourceInfo Info { get; }
+
+private ImageDocument(PixelBuffer buffer, SourceInfo info)
+{
+    Buffer = buffer;
+    DisplayImage = Bitmaps.FromBuffer(buffer);
+    Info = info;
+}
+@
+
+\subsection{Decoding with WIC}
+
+Reading a file has the same three steps as in Chapter~\ref{ch:model}: decode the first image, bring it
+into the working format, and record what the file was.
+
+<<Win ImageDocument: reading a file>>=
+/// <summary>Decodes an image file. Safe to call off the UI thread.</summary>
+public static ImageDocument Load(string path)
+{
+    <<Win ImageDocument: decoding the first frame>>
+
+    <<Win ImageDocument: converting to the working buffer>>
+
+    <<Win ImageDocument: recording facts about the source>>
+}
+@
+
+WPF's [[BitmapDecoder]] is a thin layer over WIC, which chooses the codec from the file's contents.
+Three options matter. [[PreservePixelFormat]] keeps the frame in its stored pixel format, so the
+facts below describe the file and not a conversion. [[IgnoreImageCache]] makes sure the file is
+really read again, not served from WPF's cache of recently opened images, which would show a stale
+image after the file was changed on disk. [[OnLoad]] decodes everything immediately, so the file
+stream can be closed when the method returns. A file with several frames, such as an animated GIF or
+a multi-page TIFF, contributes its first, like [[CGImageSourceCreateImageAtIndex(source, 0, nil)]].
+Errors are exceptions, which the caller turns into a message.
+
+<<Win ImageDocument: decoding the first frame>>=
+using var stream = File.OpenRead(path);
+var decoder = BitmapDecoder.Create(
+    stream, BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreImageCache, BitmapCacheOption.OnLoad);
+if (decoder.Frames.Count == 0) throw new InvalidDataException("The file contains no image.");
+BitmapFrame frame = decoder.Frames[0];
+int w = frame.PixelWidth, h = frame.PixelHeight;
+if (w <= 0 || h <= 0) throw new InvalidDataException("The image is empty.");
+@
+
+On macOS, [[PixelBuffer(cgImage:)]] drew the image into an 8-bit sRGB context, and Core Graphics
+converted the colors from the image's embedded profile on the way (Chapter~\ref{ch:pixels}). WIC
+doesn't convert colors unless asked, so the port asks explicitly: the frame is converted to sRGB and to
+premultiplied BGRA, the bytes are copied out with a stride of four bytes per pixel, and the core turns
+them into a float buffer ([[FromPremultipliedBgra8]], Chapter~\ref{ch:win-core}). The result is the
+same sRGB-encoded, straight-alpha buffer the Mac produces.
+
+<<Win ImageDocument: converting to the working buffer>>=
+var profile = frame.ColorContexts is { Count: > 0 } contexts ? contexts[0] : null;
+BitmapSource sRGB = ToSrgbPbgra32(frame, profile);
+var bytes = new byte[w * h * 4];
+sRGB.CopyPixels(bytes, w * 4, 0);
+var buffer = PixelBuffer.FromPremultipliedBgra8(w, h, bytes);
+@
+
+Like the macOS version, the port ignores the EXIF orientation tag, for the reason given in
+Chapter~\ref{ch:model}: LineScope analyzes the pixel grid as stored. WIC never applies the tag on its
+own; the orientation is only metadata, and LineScope doesn't read it. Doing nothing is therefore
+the whole implementation.
+
+The facts need some work, because WIC reports them differently. The file type comes from the codec's
+name: ``PNG Decoder'' becomes ``PNG image''. WIC gives the bits per pixel, and one \emph{mask} per
+channel, so the bits per component are their quotient, for instance $24/3 = 8$ for [[Bgr24]]. An image
+has alpha if its format has an alpha channel or, for indexed images such as GIF and 8-bit PNG, if a
+palette entry is not fully opaque. The color space is named after the embedded profile, and an image
+without one is taken to be sRGB, as the web and Windows assume.
+
+<<Win ImageDocument: recording facts about the source>>=
+var format = frame.Format;
+int channels = Math.Max(format.Masks.Count, 1);
+string codec = decoder.CodecInfo?.FriendlyName ?? "Image";
+var info = new SourceInfo(
+    FileType: codec.Replace(" Decoder", "", StringComparison.OrdinalIgnoreCase).Trim() + " image",
+    PixelWidth: w,
+    PixelHeight: h,
+    BitsPerComponent: format.BitsPerPixel / channels,
+    BitsPerPixel: format.BitsPerPixel,
+    ColorSpaceName: profile is null ? "sRGB (no embedded profile)" : ProfileDescription(profile) ?? "Embedded ICC profile",
+    HasAlpha: HasAlphaChannel(format) || (frame.Palette?.Colors.Any(c => c.A < 255) ?? false),
+    Dpi: frame.DpiX > 0 ? frame.DpiX : null);
+return new ImageDocument(buffer, info);
+@
+
+A pattern becomes a document exactly as on macOS, with the facts of a float buffer.
+
+<<Win ImageDocument: a generated test pattern>>=
+/// <summary>A generated test pattern, shown in the same analysis window as a file.</summary>
+public static ImageDocument FromPattern(TestPatternSpec spec)
+{
+    var buffer = TestPatternGenerator.Make(spec);
+    return new ImageDocument(buffer, new SourceInfo(
+        FileType: "Generated test pattern",
+        PixelWidth: buffer.Width,
+        PixelHeight: buffer.Height,
+        BitsPerComponent: 32,
+        BitsPerPixel: 128,
+        ColorSpaceName: "sRGB (float)",
+        HasAlpha: false,
+        Dpi: null));
+}
+@
+
+\subsection{Color management}
+
+The conversion uses WPF's [[ColorConvertedBitmap]], which runs the frame through the Windows color
+system from the embedded profile to a destination context. A [[ColorContext]] made from a pixel format
+alone, here [[Bgra32]], is the standard sRGB profile. Profiles found in the wild are sometimes
+broken or of a kind the color system doesn't support; then the conversion throws, and the stored
+values are used as they are, which means they are read as sRGB. A plain format conversion does that,
+and is also the path for images without a profile. Both results are frozen: a frozen WPF object is
+immutable and may be used from any thread, and this code runs on a background thread.
+
+<<Win ImageDocument: converting to sRGB>>=
+private static BitmapSource ToSrgbPbgra32(BitmapFrame frame, ColorContext? profile)
+{
+    if (profile is not null)
+    {
+        try
+        {
+            var converted = new ColorConvertedBitmap(frame, profile, new ColorContext(PixelFormats.Bgra32), PixelFormats.Pbgra32);
+            converted.Freeze();
+            return converted;
+        }
+        catch (Exception)
+        {
+            // Unsupported or broken profile: fall back to the stored values.
+        }
+    }
+    var plain = new FormatConvertedBitmap(frame, PixelFormats.Pbgra32, null, 0);
+    plain.Freeze();
+    return plain;
+}
+@
+
+WPF's pixel formats don't say whether they have alpha, so the formats with an alpha channel are
+listed. The premultiplied and straight variants both count.
+
+<<Win ImageDocument: detecting alpha>>=
+private static bool HasAlphaChannel(PixelFormat f) =>
+    f == PixelFormats.Bgra32 || f == PixelFormats.Pbgra32 || f == PixelFormats.Rgba64 || f == PixelFormats.Prgba64
+    || f == PixelFormats.Rgba128Float || f == PixelFormats.Prgba128Float;
+@
+
+Core Graphics gives a color space a name, such as ``Display P3''. WPF has no such property, so the
+port reads the name from the profile itself. An ICC profile starts with a 128-byte header, followed by
+a tag count and a table of 12-byte entries, each a four-letter signature, an offset and a size, all
+big-endian. The name is the tag with signature [[desc]]. Its contents come in two types. Version~2
+profiles use the \emph{text description} type, also marked [[desc]]: an ASCII length at offset~8 and
+the ASCII text at offset~12. Version~4 profiles use the \emph{multi-localized Unicode} type,
+[[mluc]]: a list of records, one per language, the first of which gives the length and offset of a
+UTF-16 big-endian string at offsets~20 and~24. The code takes the first language. Every read is
+checked against the length of the data, and any failure leaves the generic name ``Embedded ICC
+profile''; a name is not worth rejecting an image for.
+
+<<Win ImageDocument: the ICC profile's name>>=
+/// <summary>Reads the profile's description tag ('desc' in ICC v2, 'mluc' in v4).</summary>
+private static string? ProfileDescription(ColorContext profile)
+{
+    try
+    {
+        using var s = profile.OpenProfileStream();
+        using var ms = new MemoryStream();
+        s.CopyTo(ms);
+        var d = ms.ToArray();
+        if (d.Length < 132) return null;
+        uint count = BE32(d, 128);
+        for (int i = 0; i < count && 132 + i * 12 + 12 <= d.Length; i++)
+        {
+            int t = 132 + i * 12;
+            if (Encoding.ASCII.GetString(d, t, 4) != "desc") continue;
+            int off = (int)BE32(d, t + 4), size = (int)BE32(d, t + 8);
+            if (off + size > d.Length || size < 12) return null;
+            string type = Encoding.ASCII.GetString(d, off, 4);
+            if (type == "desc")
+            {
+                int len = (int)BE32(d, off + 8);
+                return Encoding.ASCII.GetString(d, off + 12, Math.Max(0, Math.Min(len, size - 12))).TrimEnd('\0');
+            }
+            if (type == "mluc" && size >= 28)
+            {
+                int recLen = (int)BE32(d, off + 20), recOff = (int)BE32(d, off + 24);
+                if (off + recOff + recLen <= d.Length)
+                    return Encoding.BigEndianUnicode.GetString(d, off + recOff, recLen).TrimEnd('\0');
+            }
+            return null;
+        }
+    }
+    catch (Exception)
+    {
+    }
+    return null;
+}
+
+private static uint BE32(byte[] d, int i) => (uint)(d[i] << 24 | d[i + 1] << 16 | d[i + 2] << 8 | d[i + 3]);
+@
+
+The last piece renders a buffer for display, and every variant uses it, not only the original. It
+plays the part of [[makeCGImage]]. The bitmap is set to 96 dots per inch, the value at which WPF
+maps one pixel to one device-independent unit, so an image is drawn at its true pixel size on a
+monitor at 100\% scale, and the views can compensate for other scales (Chapter~\ref{ch:win-views}).
+
+<<Win ImageDocument: rendering a buffer>>=
+public static class Bitmaps
+{
+    /// <summary>Renders a buffer as a frozen 8-bit premultiplied BGRA bitmap at 96 dpi (1 pixel = 1 DIP).</summary>
+    public static BitmapSource FromBuffer(PixelBuffer buffer)
+    {
+        var bitmap = BitmapSource.Create(buffer.Width, buffer.Height, 96, 96, PixelFormats.Pbgra32, null,
+            buffer.ToPremultipliedBgra8(), buffer.Width * 4);
+        bitmap.Freeze();
+        return bitmap;
+    }
+}
+@
+
+\section{Variants, zones and panes}
+
+The small types of the session follow Chapter~\ref{ch:model} closely. The differences come from the
+languages.
+
+<<Windows/LineScope.App/Model/ImageVariant.cs>>=
+using System.Windows.Media.Imaging;
+using LineScope.Core;
+
+namespace LineScope.App.Model;
+
+<<Win ImageVariant: the variant type>>
+
+<<Win ImageVariant: zones>>
+
+<<Win ImageVariant: panes>>
+
+<<Win ImageVariant: the frequency axis>>
+
+<<Win ImageVariant: operation requests>>
+@
+
+A variant is immutable, as on macOS, and keeps its lineage. C\#~12's \emph{primary constructor}
+lets the class take its values in its declaration. The Swift [[UUID]] is a [[Guid]] here, and
+the arrow-joined name is built with [[string.Join]].
+
+<<Win ImageVariant: the variant type>>=
+/// <summary>The original image or one derived copy. Each copy records the chain of operations back to the original.</summary>
+public sealed class ImageVariant(PixelBuffer buffer, BitmapSource bitmap, Guid? parentId, ImageOperation? operation,
+    IReadOnlyList<ImageOperation> lineage)
+{
+    public Guid Id { get; } = Guid.NewGuid();
+    public PixelBuffer Buffer { get; } = buffer;
+    public BitmapSource Bitmap { get; } = bitmap;
+    public Guid? ParentId { get; } = parentId;
+    public ImageOperation? Operation { get; } = operation;
+    /// <summary>Operations applied to the original, in order. Empty for the original.</summary>
+    public IReadOnlyList<ImageOperation> Lineage { get; } = lineage;
+
+    public bool IsOriginal => Operation is null;
+
+    public string Name => Lineage.Count == 0 ? "Original" : string.Join(" → ", Lineage.Select(o => o.DisplayName));
+}
+@
+
+A C\# enumeration is only a named integer: it can't have methods, and it doesn't list its cases. Each
+enumeration therefore has a static companion class, with the list of cases in [[All]], the
+counterpart of [[CaseIterable]], and extension methods that give it the Swift computed properties,
+here [[Title]]. The zone's integer value indexes the pane arrays, as its raw value did.
+
+<<Win ImageVariant: zones>>=
+/// <summary>Which kind of content a zone shows.</summary>
+public enum Zone { Images, Profile, Spectrum }
+
+public static class ZoneInfo
+{
+    public static readonly Zone[] All = [Zone.Images, Zone.Profile, Zone.Spectrum];
+
+    public static string Title(this Zone z) => z switch
+    {
+        Zone.Images => "Images",
+        Zone.Profile => "Line Profile",
+        _ => "Spectrum",
+    };
+}
+@
+
+A pane is a \emph{class}, where Swift had a struct. The Swift session changed a pane by assigning
+into its array, and observation noticed the assignment. Here the session changes the pane's
+[[VariantId]] in place and announces the change itself (below). The pane's own identifier is kept,
+for the views to recognize a pane across rebuilds.
+
+<<Win ImageVariant: panes>>=
+/// <summary>One side-by-side pane inside a zone; it shows one variant at a time.</summary>
+public sealed class PaneState(Guid variantId)
+{
+    public Guid Id { get; } = Guid.NewGuid();
+    public Guid VariantId { get; set; } = variantId;
+}
+@
+
+<<Win ImageVariant: the frequency axis>>=
+public enum FrequencyAxis { CyclesPerPixel, CyclesPerLine }
+
+public static class FrequencyAxisInfo
+{
+    public static readonly FrequencyAxis[] All = [FrequencyAxis.CyclesPerPixel, FrequencyAxis.CyclesPerLine];
+
+    public static string DisplayName(this FrequencyAxis a) => a == FrequencyAxis.CyclesPerPixel ? "cycles/pixel" : "cycles/line";
+}
+@
+
+A Swift enumeration with an associated value, [[resample(ResampleMethod)]], has no direct counterpart
+in C\#. The usual substitute is a small closed hierarchy: an abstract record with one nested record per
+case, which a [[switch]] expression takes apart by type, and a [[Resample]] case that carries its
+method. The compiler can't prove that the switch covers every case, since another class could derive
+from the record, hence the empty default. The request needs no identifier: SwiftUI's
+[[sheet(item:)]] required one, but the Windows parameter dialog is simply shown, modally, by the menu
+command (Chapter~\ref{ch:win-views}).
+
+<<Win ImageVariant: operation requests>>=
+/// <summary>Operations that need parameters before running; shown as a dialog.</summary>
+public abstract record OperationRequest
+{
+    public sealed record GaussianBlur : OperationRequest;
+    public sealed record BoxBlur : OperationRequest;
+    public sealed record UnsharpMask : OperationRequest;
+    public sealed record NoiseReduction : OperationRequest;
+    public sealed record Resample(ResampleMethod Method) : OperationRequest;
+
+    public string Title => this switch
+    {
+        GaussianBlur => "Gaussian Blur",
+        BoxBlur => "Box Blur",
+        UnsharpMask => "Sharpen (Unsharp Mask)",
+        NoiseReduction => "Noise Reduction",
+        Resample r => $"Resample: {r.Method.DisplayName()}",
+        _ => "",
+    };
+}
+@
+
+\section{The session}
+
+The session has the same state and the same methods as in Chapter~\ref{ch:model}, and the reasoning
+there, from the normalized line to the shared analysis settings and chaining through the focused
+variant, applies without change. What changes is how the views learn that something happened.
+
+<<Windows/LineScope.App/Model/Session.cs>>=
+using System.IO;
+using System.Windows;
+using System.Windows.Media.Imaging;
+using LineScope.Core;
+using Microsoft.Win32;
+
+namespace LineScope.App.Model;
+
+<<Win Session: the profile record>>
+
+<<Win Session: change flags>>
+
+/// <summary>All state for one document window: the variants, the shared line, and view settings.</summary>
+public sealed class Session
+{
+    <<Win Session: identity, variants and events>>
+
+    <<Win Session: initialization>>
+
+    <<Win Session: raising a change>>
+
+    <<Win Session: the line>>
+
+    <<Win Session: color model and channel>>
+
+    <<Win Session: spectrum and display settings>>
+
+    <<Win Session: panes, focus and running operations>>
+
+    <<Win Session: looking up variants>>
+
+    // Panes
+
+    <<Win Session: selecting and splitting panes>>
+
+    // Variants
+
+    <<Win Session: closing a variant>>
+
+    <<Win Session: performing an operation in the background>>
+
+    <<Win Session: showing a new variant>>
+
+    // Analysis
+
+    <<Win Session: computing a profile>>
+
+    <<Win Session: computing a spectrum>>
+
+    // Export
+
+    <<Win Session: exporting the focused variant>>
+}
+
+<<Win Session: the active session>>
+@
+
+A profile is simpler than on macOS. Swift Charts wanted a list of identifiable points; the port's
+chart view (Chapter~\ref{ch:win-views}) draws from plain arrays, so a profile holds the positions along
+the line, the channel values and the samples they came from.
+
+<<Win Session: the profile record>>=
+public sealed record Profile(double[] X, float[] Values, LineSamples Samples);
+@
+
+\subsection{Change notification}
+
+On macOS the session was [[@Observable]], and SwiftUI tracked which properties each view read and
+redrew exactly those views when one changed. WPF has a comparable mechanism, data binding with
+[[INotifyPropertyChanged]], but it is designed for XAML bindings to individual properties, and the
+views of this port are code that draws: an image canvas, charts, tab strips. For them a coarser and
+more explicit scheme is simpler. The session raises one event, [[Changed]], after every change, and
+the event says \emph{what kind} of state changed, as a set of flags. Each view subscribes and redraws
+only if a flag it depends on is set. Dragging the line raises [[Line]]: the canvases redraw the line
+and the charts recompute their profile and spectrum, but the tab strips, which show only the
+variants, ignore it. Choosing a tab raises [[Panes]] and [[Focus]], and the charts ignore the focus.
+
+The flags are powers of two, so a change can combine them with [[|]], and [[[Flags]]] tells .NET to
+treat the enumeration as a set, for instance when printing it. [[Running]] covers the count of
+background operations, which drives the progress indicator.
+
+<<Win Session: change flags>>=
+/// <summary>What changed in a <see cref="Session"/>, so views redraw only what they show.</summary>
+[Flags]
+public enum SessionChange
+{
+    None = 0,
+    Line = 1,
+    Settings = 2,
+    Variants = 4,
+    Panes = 8,
+    Focus = 16,
+    Running = 32,
+    All = Line | Settings | Variants | Panes | Focus | Running,
+}
+@
+
+Besides [[Changed]] there is an [[Error]] event. The Swift session stored an [[errorMessage]] for an
+alert to observe; here the window subscribes and shows a message box. Both events are raised on the UI
+thread only, as all of the session's state is touched only there. That was the meaning of
+[[@MainActor]] in Swift; in C\# it is a convention that the code below keeps.
+
+<<Win Session: identity, variants and events>>=
+public string FileName { get; }
+public SourceInfo SourceInfo { get; }
+
+private readonly List<ImageVariant> _variants;
+public IReadOnlyList<ImageVariant> Variants => _variants;
+
+/// <summary>Raised on the UI thread after any state change.</summary>
+public event Action<SessionChange>? Changed;
+public event Action<string>? Error;
+@
+
+A new session has the original, focused, in one pane of each zone, as before.
+
+<<Win Session: initialization>>=
+public Session(ImageDocument document, string fileName)
+{
+    var original = new ImageVariant(document.Buffer, document.DisplayImage, null, null, []);
+    FileName = fileName;
+    SourceInfo = document.Info;
+    _variants = [original];
+    _focusedVariantId = original.Id;
+    Panes = ZoneInfo.All.Select(_ => new List<PaneState> { new(original.Id) }).ToArray();
+}
+@
+
+<<Win Session: raising a change>>=
+private void Raise(SessionChange change) => Changed?.Invoke(change);
+@
+
+\subsection{State}
+
+Every setting is a property with a private field, and its setter follows one pattern: if the value is
+really new, store it and raise the flag. The comparison matters. A slider or a mouse drag assigns
+the same value many times, and without the test each assignment would make every view redraw.
+
+<<Win Session: the line>>=
+private LineSegment _line = LineSegment.Initial;
+public LineSegment Line
+{
+    get => _line;
+    set { if (_line != value) { _line = value; Raise(SessionChange.Line); } }
+}
+@
+
+The color model keeps the rule of Chapter~\ref{ch:model}: a channel index that would be out of range
+for the new model is reset. The setter assigns the \emph{field} [[_channelIndex]], not the property,
+so the two changes are announced by one event rather than two.
+
+<<Win Session: color model and channel>>=
+private ColorModel _colorModel = ColorModel.Rgba;
+public ColorModel ColorModel
+{
+    get => _colorModel;
+    set
+    {
+        if (_colorModel == value) return;
+        _colorModel = value;
+        if (_channelIndex >= value.Channels().Length) _channelIndex = 0;
+        Raise(SessionChange.Settings);
+    }
+}
+
+private int _channelIndex;
+public int ChannelIndex
+{
+    get => _channelIndex;
+    set { if (_channelIndex != value) { _channelIndex = value; Raise(SessionChange.Settings); } }
+}
+@
+
+The other settings all raise [[Settings]]. Even [[UseDevicePixels]], which only affects the image
+canvases, belongs here: it is a view setting shared by all panes, like the rest.
+
+<<Win Session: spectrum and display settings>>=
+private WindowFunction _window = WindowFunction.Hann;
+public WindowFunction Window
+{
+    get => _window;
+    set { if (_window != value) { _window = value; Raise(SessionChange.Settings); } }
+}
+
+private bool _removeMean = true;
+public bool RemoveMean
+{
+    get => _removeMean;
+    set { if (_removeMean != value) { _removeMean = value; Raise(SessionChange.Settings); } }
+}
+
+private bool _logMagnitude = true;
+public bool LogMagnitude
+{
+    get => _logMagnitude;
+    set { if (_logMagnitude != value) { _logMagnitude = value; Raise(SessionChange.Settings); } }
+}
+
+private FrequencyAxis _frequencyAxis = FrequencyAxis.CyclesPerPixel;
+public FrequencyAxis FrequencyAxis
+{
+    get => _frequencyAxis;
+    set { if (_frequencyAxis != value) { _frequencyAxis = value; Raise(SessionChange.Settings); } }
+}
+
+private bool _useDevicePixels;
+public bool UseDevicePixels
+{
+    get => _useDevicePixels;
+    set { if (_useDevicePixels != value) { _useDevicePixels = value; Raise(SessionChange.Settings); } }
+}
+@
+
+The panes are an array of lists, indexed by zone, and the lists and panes are changed only by the
+session's methods below. [[RunningOperations]] can be read by anyone but changed only by the session.
+There is no [[pendingRequest]]: on macOS it drove a sheet from the session's state, while here the menu
+command shows the parameter dialog directly.
+
+<<Win Session: panes, focus and running operations>>=
+/// <summary>Panes per zone, indexed by <see cref="Zone"/>.</summary>
+public List<PaneState>[] Panes { get; }
+
+private Guid _focusedVariantId;
+/// <summary>The variant operations apply to and the inspector describes.</summary>
+public Guid FocusedVariantId
+{
+    get => _focusedVariantId;
+    set { if (_focusedVariantId != value) { _focusedVariantId = value; Raise(SessionChange.Focus); } }
+}
+
+public int RunningOperations { get; private set; }
+@
+
+<<Win Session: looking up variants>>=
+public ImageVariant Original => _variants[0];
+public ImageVariant FocusedVariant => Variant(FocusedVariantId) ?? Original;
+public ImageVariant? Variant(Guid id) => _variants.FirstOrDefault(v => v.Id == id);
+public string ChannelName => ColorModel.Channels()[ChannelIndex];
+@
+
+\subsection{Panes and variants}
+
+The pane methods are those of Chapter~\ref{ch:model}, with the change events made explicit. Each
+method changes what it needs and then raises one event that covers all of it. [[Select]], for instance,
+assigns the focus through its field and raises [[Panes]] and [[Focus]] together, so the views update
+once, after the state is consistent. Raising in the middle, with the pane changed and the focus not
+yet, would let a view draw a state that never really existed.
+
+<<Win Session: selecting and splitting panes>>=
+public void Select(Guid variantId, Zone zone, int pane)
+{
+    Panes[(int)zone][pane].VariantId = variantId;
+    _focusedVariantId = variantId;
+    Raise(SessionChange.Panes | SessionChange.Focus);
+}
+
+public void Split(Zone zone)
+{
+    var shown = Panes[(int)zone].Select(p => p.VariantId).ToHashSet();
+    var next = _variants.FirstOrDefault(v => !shown.Contains(v.Id)) ?? FocusedVariant;
+    Panes[(int)zone].Add(new PaneState(next.Id));
+    Raise(SessionChange.Panes);
+}
+
+public void Unsplit(Zone zone)
+{
+    var panes = Panes[(int)zone];
+    if (panes.Count <= 1) return;
+    panes.RemoveAt(panes.Count - 1);
+    Raise(SessionChange.Panes);
+}
+@
+
+<<Win Session: closing a variant>>=
+public void CloseVariant(Guid id)
+{
+    int index = _variants.FindIndex(v => v.Id == id);
+    if (index <= 0) return;
+    _variants.RemoveAt(index);
+    foreach (var zone in Panes)
+        foreach (var pane in zone.Where(p => p.VariantId == id))
+            pane.VariantId = Original.Id;
+    if (_focusedVariantId == id) _focusedVariantId = Original.Id;
+    Raise(SessionChange.Variants | SessionChange.Panes | SessionChange.Focus);
+}
+@
+
+Performing an operation keeps the design of Chapter~\ref{ch:model}: capture the focused variant and
+its buffer first, compute in the background, and append the result on the UI thread. The C\# tools are
+different. [[Task.Run]] runs the operation on the thread pool, the counterpart of the detached task.
+The [[await]] returns to the UI thread by itself, because WPF installs a \emph{synchronization context}
+that sends continuations back to the dispatcher of the thread that awaited; this plays the role of the
+main actor. The method is [[async void]], since a menu command starts it and nobody waits for it.
+
+One step moves to the background: rendering the display bitmap. Swift made the [[CGImage]] on the main
+actor; here [[Bitmaps.FromBuffer]] runs on the worker thread too, which is allowed because it freezes
+the bitmap, and keeps the UI thread free of all per-pixel work. An exception, which the Swift
+operations couldn't throw, is reported through [[Error]]. Whatever happens, the [[finally]] block
+decrements the running count, so the progress indicator can't get stuck.
+
+<<Win Session: performing an operation in the background>>=
+/// <summary>Applies an operation to the focused variant in the background and adds the result as a new tab.</summary>
+public async void Perform(ImageOperation operation)
+{
+    var source = FocusedVariant;
+    var input = source.Buffer;
+    RunningOperations++;
+    Raise(SessionChange.Running);
+    try
+    {
+        var (output, bitmap) = await Task.Run(() =>
+        {
+            var result = operation.Apply(input);
+            return (result, Bitmaps.FromBuffer(result));
+        });
+        var variant = new ImageVariant(output, bitmap, source.Id, operation, [.. source.Lineage, operation]);
+        _variants.Add(variant);
+        Show(variant.Id);
+    }
+    catch (Exception ex)
+    {
+        Error?.Invoke($"Could not compute {operation.DisplayName}: {ex.Message}");
+    }
+    finally
+    {
+        RunningOperations--;
+        Raise(SessionChange.Running);
+    }
+}
+@
+
+The new variant goes into the last pane of each zone, for the reason given in Chapter~\ref{ch:model}.
+The index-from-end [[^1]] names that pane.
+
+<<Win Session: showing a new variant>>=
+/// <summary>
+/// Shows a new variant in every zone: in the last pane when split (so the left pane keeps the
+/// comparison baseline), otherwise in the only pane.
+/// </summary>
+private void Show(Guid id)
+{
+    foreach (var zone in Panes) zone[^1].VariantId = id;
+    _focusedVariantId = id;
+    Raise(SessionChange.Variants | SessionChange.Panes | SessionChange.Focus);
+}
+@
+
+\subsection{Analysis and export}
+
+The analysis is the same computation: sample the line in the variant's own grid, extract the channel,
+and take the spectrum with the shared settings, with the decibel floor of $-100$. Only the return
+types are simpler: arrays and a tuple of arrays, instead of lists of chart points.
+
+<<Win Session: computing a profile>>=
+public Profile Profile(ImageVariant variant)
+{
+    var samples = LineSampler.Sample(variant.Buffer, Line);
+    var values = samples.Colors.Select(c => ColorConversion.Value(c, ColorModel, ChannelIndex)).ToArray();
+    return new Profile(samples.Positions, values, samples);
+}
+@
+
+<<Win Session: computing a spectrum>>=
+public SpectrumResult Spectrum(Profile profile) =>
+    SpectrumAnalyzer.Compute(profile.Values, Math.Max(profile.Samples.Spacing, 1e-9), Window, RemoveMean);
+
+/// <summary>Frequencies on the chosen axis and magnitudes (in dB when enabled).</summary>
+public (double[] Frequencies, double[] Magnitudes) SpectrumPoints(SpectrumResult s)
+{
+    var freqs = FrequencyAxis == FrequencyAxis.CyclesPerPixel ? s.CyclesPerPixel : s.CyclesPerLine;
+    var mags = s.Amplitudes.Select(a => LogMagnitude ? Math.Max(20 * Math.Log10(Math.Max(a, 1e-12)), DbFloor) : a).ToArray();
+    return (freqs, mags);
+}
+
+public const double DbFloor = -100.0;
+@
+
+Export writes the focused variant's display bitmap as a PNG, which is again exactly what is on
+screen. Windows forbids more characters in file names than macOS does (among them [[\]], [[:]],
+[[*]], [[?]] and [[|]]), so instead of replacing only the slash, every character that
+[[Path.GetInvalidFileNameChars]] reports is replaced with a hyphen. The Save dialog is owned by the
+document window, so it is modal to it.
+
+<<Win Session: exporting the focused variant>>=
+public void ExportFocused(Window? owner)
+{
+    var variant = FocusedVariant;
+    string baseName = Path.GetFileNameWithoutExtension(FileName);
+    string suffix = variant.IsOriginal ? "original" : variant.Name.Replace(" → ", "_");
+    foreach (char c in Path.GetInvalidFileNameChars()) suffix = suffix.Replace(c, '-');
+    var dialog = new SaveFileDialog
+    {
+        Filter = "PNG image|*.png",
+        DefaultExt = ".png",
+        FileName = $"{baseName}-{suffix}.png",
+        Title = "Export Image",
+    };
+    if (dialog.ShowDialog(owner) != true) return;
+    try
+    {
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(variant.Bitmap));
+        using var stream = File.Create(dialog.FileName);
+        encoder.Save(stream);
+    }
+    catch (Exception ex)
+    {
+        Error?.Invoke($"Could not write {Path.GetFileName(dialog.FileName)}: {ex.Message}");
+    }
+}
+@
+
+\subsection{The active session}
+
+On macOS the menus found their session through a focused value, with the active session as a fallback
+for when the inspector was key. On Windows the first mechanism isn't needed: each document window has
+its own menu bar, bound to its own session (Chapter~\ref{ch:win-views}), so there is no focused-value
+entry to port. The inspector still needs the second. It is its own window, and while the user works in
+it, it is the active one.
+
+So the port keeps [[ActiveSession]]. Document windows set it when they are activated and clear it when
+they close. A static class with its own [[Changed]] event replaces the observable singleton, and the
+inspector subscribes to it, then to the [[Changed]] event of the session it names.
+
+<<Win Session: the active session>>=
+/// <summary>
+/// The session of the most recently activated document window, for the inspector window (which is itself
+/// the active window while being used).
+/// </summary>
+public static class ActiveSession
+{
+    private static Session? _session;
+
+    public static event Action? Changed;
+
+    public static Session? Current
+    {
+        get => _session;
+        set { if (_session != value) { _session = value; Changed?.Invoke(); } }
+    }
+}
+@

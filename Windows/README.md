@@ -85,4 +85,8 @@ Numbers use the current Windows locale; for example, `0,5` in a Spanish locale. 
 ## Not ported
 
 - **File associations and window restoration.** macOS registers LineScope as an image viewer and restores pattern windows on relaunch. To open a file on Windows, pass it on the command line (`LineScope.exe image.png`) or drag it onto a window.
-- **The literate program and the theory document.** `LiterateP/` and `Docs/` describe and link to the Swift sources. The C# files mirror those sources file by file, so the explanations still apply.
+
+## Documentation
+
+- **Literate program:** Part II of [`LiterateP/linescope.pdf`](../LiterateP/linescope.pdf), *LineScope for Windows*, presents every file in this directory. Its chapters are `LiterateP/chapters/80-windows-overview.nw` to `88-windows-views.nw`. After changing a C# file, update its chunk and run `make check` in `LiterateP/` (or `py lit.py check …` without `make`; see [`LiterateP/README.md`](../LiterateP/README.md)).
+- **Theory document:** [`Docs/LineScope-Theory-and-Code.md`](../Docs/LineScope-Theory-and-Code.md). §10 covers the port, and each *Code* section links to the C# counterpart by line.

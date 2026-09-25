@@ -1,6 +1,6 @@
 \chapter{Introduction}
 
-LineScope is a small macOS program for \emph{looking} at what resampling and filtering do to an
+LineScope is a small program, for macOS and for Windows, for \emph{looking} at what resampling and filtering do to an
 image. You open an image, derive copies from it (blurred, sharpened, shrunk with nearest-neighbor,
 enlarged with Lanczos, and so on), and draw a line across it. For every copy the program shows three
 things side by side:
@@ -56,6 +56,16 @@ model (Chapter~\ref{ch:model}), the SwiftUI views (Chapter~\ref{ch:views}) and t
 
 This split keeps the mathematics testable without a window, and keeps the views thin: a view
 asks the session for a profile or a spectrum and draws it.
+
+These two parts form Part~I of the book, \emph{LineScope for macOS}. Part~II, \emph{LineScope for
+Windows}, presents a native port written in C\# with .NET~9 and WPF (Chapter~ef{ch:win-overview}).
+The port has the same split, file for file: a UI-free library [[LineScope.Core]]
+(Chapter~ef{ch:win-core}) with its tests (Chapter~ef{ch:win-tests}), and a WPF application
+with its session model (Chapter~ef{ch:win-model}) and views (Chapter~ef{ch:win-views}). The
+numeric algorithms are kept identical, so Part~II doesn't repeat the theory. It concentrates on
+what had to change: an FFT of its own in place of Apple's vDSP, CPU versions of the Core Image
+filters, and the WPF plumbing for windows, menus and drawing. The root chunks of Part~II are the
+files under [[Windows/]], and [[make check]] verifies them in the same way.
 
 \section{Building}
 

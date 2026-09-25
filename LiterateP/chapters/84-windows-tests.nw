@@ -1,0 +1,570 @@
+\chapter{Tests in C\#}\label{ch:win-tests}
+
+The tests of the core are ported along with the core. Their purpose is the one stated in
+Chapter~\ref{ch:tests}: each test pins down a property the rest of the program depends on. For the
+port there is a second purpose. Since the algorithms are meant to be identical on both systems, a
+test that passes in Swift and in C\# with the same inputs, expected values and tolerances is
+evidence that the transcription is faithful. So every XCTest test has a C\# twin with the same
+numbers. The port also adds tests of its own, for the two pieces that are new: the FFT and the CPU
+filters that replace Core Image.
+
+\section{The test project}
+
+The tests use xUnit, the most common test framework for .NET. The project references the test SDK
+(which lets [[dotnet test]] find and run the tests), xUnit itself, and its runner for Visual Studio
+and the command line. It references the core project, not the app, so the tests run without WPF.
+The [[Using]] item imports the [[Xunit]] namespace into every file, the way [[import XCTest]] does
+in Swift.
+
+The Swift tests used [[@testable import]] to reach internal members. The C\# counterpart is on the
+other side: the core's project file grants [[InternalsVisibleTo]] to this test assembly
+(Chapter~\ref{ch:win-core}), which lets the tests call the internal [[Fft]] class and the filter
+kernels.
+
+<<Windows/LineScope.Core.Tests/LineScope.Core.Tests.csproj>>=
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LineScope.Core\LineScope.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>
+@
+
+\section{The test file}
+
+The file keeps the structure of the Swift one: a class per area, a method per property. In xUnit a
+test is a public method marked [[[Fact]]], and the class needs no base class. The method names drop
+Swift's [[test]] prefix, which XCTest needed to discover them. A single test is run with a filter on
+its full name:
+\begin{lstlisting}[language={}]
+dotnet test LineScope.Core.Tests --filter "FullyQualifiedName~SpectrumTests.SinePeak"
+\end{lstlisting}
+
+<<Windows/LineScope.Core.Tests/LineScopeCoreTests.cs>>=
+using LineScope.Core;
+
+namespace LineScope.Core.Tests;
+
+<<Win Tests: helpers>>
+
+<<Win Tests: spectrum>>
+
+<<Win Tests: resampling>>
+
+<<Win Tests: color conversions>>
+
+<<Win Tests: line sampler>>
+
+<<Win Tests: bitmap bridge>>
+
+<<Win Tests: filters>>
+
+<<Win Tests: test patterns>>
+@
+
+The gradient fixture is the one of Chapter~\ref{ch:tests}: pixel $(x,y)$ is
+$(x/W,\ y/H,\ \frac14)$, opaque. xUnit has no counterpart of XCTest's
+[[XCTAssertEqual(_:_:accuracy:)]], so a small helper provides it: [[Near]] fails unless the two
+values differ by at most the accuracy, and the optional label says which case failed when a test
+loops over methods or bins.
+
+<<Win Tests: helpers>>=
+internal static class Helpers
+{
+    public static PixelBuffer Gradient(int width, int height)
+    {
+        var buf = new PixelBuffer(width, height);
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                buf[x, y] = new Rgba((float)x / width, (float)y / height, 0.25f, 1);
+        return buf;
+    }
+
+    public static void Near(double expected, double actual, double accuracy, string? label = null) =>
+        Assert.True(Math.Abs(expected - actual) <= accuracy,
+            $"{label} expected {expected} ± {accuracy}, got {actual}");
+}
+@
+
+\section{Spectrum}
+
+The first two tests are the Swift ones: a sine of $k=16$ periods in $n=256$ samples must put an
+amplitude of $1$ in bin $16$, at $16/256$ cycles per pixel, with the last bin at Nyquist; and a
+constant $0.3$ with the mean kept must give amplitude $0.3$ in bin $0$, with $100$ samples padded
+to an FFT of $128$. They check the normalization and the frequency axis, which the port keeps from
+vDSP's conventions, and they pass unchanged.
+
+<<Win Tests: spectrum>>=
+public class SpectrumTests
+{
+    [Fact]
+    public void SinePeak()
+    {
+        const int n = 256, k = 16;
+        var values = Enumerable.Range(0, n).Select(i => (float)Math.Sin(2 * Math.PI * k * i / n)).ToArray();
+        var s = SpectrumAnalyzer.Compute(values, 1, WindowFunction.None, removeMean: true);
+        Assert.Equal(256, s.FftSize);
+        Assert.Equal(k, s.PeakIndex);
+        Helpers.Near(1, s.Amplitudes[k], 1e-3);
+        Helpers.Near((double)k / n, s.CyclesPerPixel[k], 1e-9);
+        Helpers.Near(0.5, s.CyclesPerPixel[^1], 1e-9);
+    }
+
+    [Fact]
+    public void DCAmplitude()
+    {
+        var s = SpectrumAnalyzer.Compute(Enumerable.Repeat(0.3f, 100).ToArray(), 1, WindowFunction.None, removeMean: false);
+        Assert.Equal(128, s.FftSize);
+        Helpers.Near(0.3, s.Amplitudes[0], 1e-4);
+    }
+
+    <<Win Tests: the FFT against a naive DFT>>
+}
+@
+
+These tests would not catch every mistake in a hand-written FFT. A pure sine concentrates its
+energy in one bin, and several classic errors, such as a wrong twiddle factor in a later stage,
+leave a sine's peak in the right place while scrambling the other bins. The macOS version didn't
+need more, since vDSP is a trusted library; the port's own FFT (Chapter~\ref{ch:win-core}) does.
+
+The new test compares the FFT with the \emph{definition} of the discrete Fourier transform,
+\[
+  X_k = \sum_{j=0}^{N-1} x_j\, e^{-2\pi i\, jk/N}, \qquad k = 0, \dots, N-1,
+\]
+computed directly, in $O(N^2)$ operations, for $N=64$ random real samples. The random generator is
+seeded, so the test is repeatable. Every bin must agree to $10^{-9}$. In double precision the
+rounding error of both computations is around $10^{-14}$ for sums of this size, so the tolerance is
+generous for a correct FFT and far too tight for a wrong one, whose errors are of the order of the
+values themselves. The inputs are real because the analyzer only ever transforms real profiles.
+
+<<Win Tests: the FFT against a naive DFT>>=
+[Fact]
+public void FftMatchesNaiveDft()
+{
+    var rng = new Random(3);
+    var x = Enumerable.Range(0, 64).Select(_ => new System.Numerics.Complex(rng.NextDouble(), 0)).ToArray();
+    var fast = (System.Numerics.Complex[])x.Clone();
+    Fft.Forward(fast);
+    for (int k = 0; k < x.Length; k++)
+    {
+        System.Numerics.Complex sum = 0;
+        for (int j = 0; j < x.Length; j++)
+            sum += x[j] * System.Numerics.Complex.FromPolarCoordinates(1, -2 * Math.PI * j * k / x.Length);
+        Helpers.Near(0, (sum - fast[k]).Magnitude, 1e-9, $"bin {k}");
+    }
+}
+@
+
+\section{Resampling}
+
+The four resampling tests are transcriptions of the Swift ones, and Chapter~\ref{ch:tests} derives
+their expected values: the interpolating kernels are $1$ at $0$ and $0$ at the other integers,
+Mitchell-Netravali gives $k(0)=\frac89$ and $k(1)=\frac1{18}$, Catmull-Rom gives
+$k(\frac12)=\frac9{16}$, and the sinc is truncated at its radius; every method but Mitchell is the
+identity at scale $1$; the area method averages exact pairs at scale $\frac12$; and a constant image
+stays constant at every scale. The kernel function is internal, as in Swift.
+
+<<Win Tests: resampling>>=
+public class ResamplingTests
+{
+    <<Win Tests: kernel shapes>>
+
+    <<Win Tests: identity at scale one>>
+
+    <<Win Tests: area average halves>>
+
+    <<Win Tests: constants stay constant>>
+}
+@
+
+<<Win Tests: kernel shapes>>=
+[Fact]
+public void KernelShapes()
+{
+    // Interpolating kernels are 1 at 0 and 0 at nonzero integers.
+    foreach (var method in new[] { ResampleMethod.Tent, ResampleMethod.CatmullRom, ResampleMethod.Lanczos3, ResampleMethod.Sinc })
+    {
+        Helpers.Near(1, Resampler.Kernel(method, 0), 1e-12, method.ToString());
+        for (int k = 1; k <= 3; k++)
+            Helpers.Near(0, Resampler.Kernel(method, k), 1e-12, $"{method} at {k}");
+    }
+    // Mitchell-Netravali (B = C = 1/3) is approximating: k(0) = 8/9, k(1) = 1/18.
+    Helpers.Near(8.0 / 9, Resampler.Kernel(ResampleMethod.Mitchell, 0), 1e-12);
+    Helpers.Near(1.0 / 18, Resampler.Kernel(ResampleMethod.Mitchell, 1), 1e-12);
+    Helpers.Near(0, Resampler.Kernel(ResampleMethod.Mitchell, 2), 1e-12);
+    Helpers.Near(0.5625, Resampler.Kernel(ResampleMethod.CatmullRom, 0.5), 1e-12);
+    // Sinc is truncated at its radius.
+    Assert.Equal(0, Resampler.Kernel(ResampleMethod.Sinc, Resampler.SincRadius + 0.5));
+}
+@
+
+[[ResampleMethodInfo.All]] stands in for Swift's [[ResampleMethod.allCases]]: a C\# enumeration has
+no built-in list of its cases, so the core provides one.
+
+<<Win Tests: identity at scale one>>=
+[Fact]
+public void IdentityAtScaleOne()
+{
+    var src = Helpers.Gradient(17, 9);
+    // Mitchell is approximating (slightly smoothing), so it is not an identity at ×1.
+    foreach (var method in ResampleMethodInfo.All.Where(m => m != ResampleMethod.Mitchell))
+    {
+        var output = Resampler.Resample(src, 1, method);
+        Assert.Equal(17, output.Width);
+        Assert.Equal(9, output.Height);
+        for (int i = 0; i < src.Data.Length; i++)
+            Helpers.Near(src.Data[i], output.Data[i], 1e-5, method.ToString());
+    }
+}
+@
+
+<<Win Tests: area average halves>>=
+[Fact]
+public void AreaHalvesAverages()
+{
+    var src = new PixelBuffer(4, 1);
+    float[] values = [0, 1, 0.2f, 0.6f];
+    for (int x = 0; x < values.Length; x++) src[x, 0] = new Rgba(values[x], values[x], values[x]);
+    var output = Resampler.Resample(src, 0.5, ResampleMethod.Area);
+    Assert.Equal(2, output.Width);
+    Helpers.Near(0.5, output[0, 0].R, 1e-5);
+    Helpers.Near(0.4, output[1, 0].R, 1e-5);
+}
+@
+
+<<Win Tests: constants stay constant>>=
+[Fact]
+public void ConstantImageStaysConstant()
+{
+    var src = new PixelBuffer(13, 7, new Rgba(0.4f, 0.5f, 0.6f));
+    foreach (var method in ResampleMethodInfo.All)
+        foreach (double scale in new[] { 0.3, 0.5, 2.0, 3.7 })
+        {
+            var output = Resampler.Resample(src, scale, method);
+            for (int i = 0; i < output.Data.Length; i += 4)
+                Helpers.Near(0.4, output.Data[i], 1e-4, $"{method} {scale}");
+        }
+}
+@
+
+\section{Color conversions and line sampling}
+
+The color tests are the same round trips as in Swift, with the same colors, and the same absolute
+check that pure blue has hue $240^\circ$. The line sampler tests are the same too: $201$ and $101$
+samples on a $200$-pixel image and its half-size copy, and a vertical line at $u=0.505$ that reads
+exactly the red of pixel column $50$. The C\# index-from-end operator [[^1]] replaces Swift's
+[[last!]].
+
+<<Win Tests: color conversions>>=
+public class ColorTests
+{
+    [Fact]
+    public void HslRoundTrip()
+    {
+        foreach (var c in new[] { new Rgba(0.2f, 0.7f, 0.4f), new Rgba(1, 0, 0), new Rgba(0.1f, 0.1f, 0.9f), new Rgba(0.5f, 0.5f, 0.5f) })
+        {
+            var hsl = ColorConversion.Hsl(c);
+            var back = ColorConversion.FromHsl(hsl.H, hsl.S, hsl.L);
+            Helpers.Near(c.R, back.R, 1e-5);
+            Helpers.Near(c.G, back.G, 1e-5);
+            Helpers.Near(c.B, back.B, 1e-5);
+        }
+        Helpers.Near(240, ColorConversion.Hsl(new Rgba(0, 0, 1)).H, 1e-4);
+    }
+
+    [Fact]
+    public void CmykRoundTrip()
+    {
+        foreach (var c in new[] { new Rgba(0.2f, 0.7f, 0.4f), new Rgba(0, 0, 0), new Rgba(1, 1, 1) })
+        {
+            var v = ColorConversion.Cmyk(c);
+            var back = ColorConversion.FromCmyk(v.C, v.M, v.Y, v.K);
+            Helpers.Near(c.R, back.R, 1e-5);
+            Helpers.Near(c.G, back.G, 1e-5);
+            Helpers.Near(c.B, back.B, 1e-5);
+        }
+    }
+}
+@
+
+<<Win Tests: line sampler>>=
+public class LineSamplerTests
+{
+    [Fact]
+    public void SampleCountScalesWithResample()
+    {
+        var src = Helpers.Gradient(200, 100);
+        var half = Resampler.Resample(src, 0.5, ResampleMethod.Tent);
+        var a = LineSampler.Sample(src, LineSegment.Initial);
+        var b = LineSampler.Sample(half, LineSegment.Initial);
+        Assert.Equal(201, a.Colors.Length);
+        Assert.Equal(101, b.Colors.Length);
+        Helpers.Near(1, a.Spacing, 1e-9);
+    }
+
+    [Fact]
+    public void SamplesFollowContent()
+    {
+        var src = Helpers.Gradient(100, 100);
+        var line = new LineSegment(new NormalizedPoint(0.505, 0.1), new NormalizedPoint(0.505, 0.9));
+        var s = LineSampler.Sample(src, line);
+        // Vertical line through pixel column 50: red is constant, green increases.
+        Helpers.Near(0.5, s.Colors[0].R, 1e-4);
+        Helpers.Near(0.5, s.Colors[^1].R, 1e-4);
+        Assert.True(s.Colors[0].G < s.Colors[^1].G);
+    }
+}
+@
+
+\section{The bitmap bridge}
+
+On macOS the bridge to the screen was a [[CGImage]]; here it is an array of 8-bit premultiplied
+BGRA bytes, the layout of WPF's [[Pbgra32]] format (Chapter~\ref{ch:win-core}). The round-trip test
+is the Swift one: converting to bytes and back may lose one quantization step, $\frac1{255}$, and
+must keep the size and the row order.
+
+A second test checks what the round trip can't see: the \emph{order} of the bytes. If red and blue
+were swapped in both directions, the round trip would still pass, and every image would show with
+its colors exchanged. So one orange pixel, $(1, 0.5, 0)$ opaque, must become the bytes blue, green,
+red, alpha $= (0, 128, 255, 255)$. The $128$ also checks the rounding: $0.5 \cdot 255 = 127.5$ rounds
+up.
+
+<<Win Tests: bitmap bridge>>=
+public class BitmapBridgeTests
+{
+    [Fact]
+    public void Bgra8RoundTrip()
+    {
+        var src = Helpers.Gradient(32, 16);
+        var bytes = src.ToPremultipliedBgra8();
+        var back = PixelBuffer.FromPremultipliedBgra8(32, 16, bytes);
+        Assert.Equal(32, back.Width);
+        Assert.Equal(16, back.Height);
+        for (int i = 0; i < src.Data.Length; i++)
+            Helpers.Near(src.Data[i], back.Data[i], 1.0 / 255 + 1e-4);
+    }
+
+    [Fact]
+    public void Bgra8ChannelOrder()
+    {
+        var src = new PixelBuffer(1, 1, new Rgba(1, 0.5f, 0, 1));
+        var bytes = src.ToPremultipliedBgra8();
+        Assert.Equal(new byte[] { 0, 128, 255, 255 }, bytes);
+    }
+}
+@
+
+\section{Filters}
+
+The filter tests grow the most, because the port reimplements the five Core Image filters on the
+CPU. On macOS there was little to test there: Core Image is Apple's, and the tests only had to show
+that LineScope called it correctly. Here the filters are LineScope's own code, so they get tests of
+their own.
+
+<<Win Tests: filters>>=
+public class FilterTests
+{
+    <<Win Tests: every filter>>
+
+    <<Win Tests: filters keep the size>>
+
+    <<Win Tests: smoothing filters keep constants>>
+
+    <<Win Tests: kernels are normalized>>
+
+    <<Win Tests: the median and the noise filter>>
+}
+@
+
+The tests draw on one list of filters, one of each kind, with moderate parameters.
+
+<<Win Tests: every filter>>=
+private static readonly FilterKind[] AllFilters =
+[
+    new FilterKind.GaussianBlur(2), new FilterKind.BoxBlur(2), new FilterKind.Median(),
+    new FilterKind.UnsharpMask(2, 0.5), new FilterKind.NoiseReduction(0.02, 0.4), new FilterKind.Sobel(),
+    new FilterKind.Laplacian(), new FilterKind.Emboss(), new FilterKind.Grayscale(), new FilterKind.Invert(),
+];
+@
+
+The first test is the Swift one, extended to every filter: the size must be kept, since the
+normalized line relies on it, and a blurred gradient must still increase from left to right. It also
+checks that every output stays in $[0,1]$. That matters most for the Sobel, Laplacian and emboss
+kernels, whose sums can leave the range, and for the unsharp mask, which overshoots at edges by
+design; both must be brought back into range before the result is stored.
+
+<<Win Tests: filters keep the size>>=
+[Fact]
+public void FiltersKeepSize()
+{
+    var src = Helpers.Gradient(24, 12);
+    foreach (var f in AllFilters)
+    {
+        var output = Filters.Apply(f, src);
+        Assert.Equal(24, output.Width);
+        Assert.Equal(12, output.Height);
+        Assert.All(output.Data, v => Assert.InRange(v, 0f, 1f));
+    }
+    var blurred = Filters.Apply(new FilterKind.GaussianBlur(1), src);
+    // Horizontal gradient stays roughly monotone and in range after blur.
+    Assert.True(blurred[2, 6].R < blurred[20, 6].R);
+}
+@
+
+A smoothing filter is a weighted average whose weights sum to one, so it must leave a constant image
+unchanged; so must the unsharp mask, which adds a multiple of $\mathit{src}-\mathit{blur}$, zero
+for a constant, and the noise reduction, which averages equal neighbors. The test checks every pixel,
+the borders included. That tests the edge handling: the filters clamp coordinates at the border,
+so the kernel always sees real pixels, and a wrong clamp shows at once as a darker or lighter frame.
+Red and blue ($0.3$ and $0.9$) are checked, which would also expose a channel mix-up.
+
+<<Win Tests: smoothing filters keep constants>>=
+[Fact]
+public void SmoothingFiltersKeepConstantImages()
+{
+    var src = new PixelBuffer(9, 7, new Rgba(0.3f, 0.6f, 0.9f));
+    foreach (var f in AllFilters.Where(f => f is FilterKind.GaussianBlur or FilterKind.BoxBlur or FilterKind.Median
+                 or FilterKind.UnsharpMask or FilterKind.NoiseReduction))
+    {
+        var output = Filters.Apply(f, src);
+        for (int i = 0; i < output.Data.Length; i += 4)
+        {
+            Helpers.Near(0.3, output.Data[i], 1e-5, f.DisplayName);
+            Helpers.Near(0.9, output.Data[i + 2], 1e-5, f.DisplayName);
+        }
+    }
+}
+@
+
+The Gaussian and box kernels are tested directly. For every radius, including $0$ and the fractional
+$0.4$, the weights must sum to one. Two exact shapes pin the box convention: the box covers
+$[-(r+\frac12),\ r+\frac12]$, so radius $0$ is the identity, a single weight $1$, and radius $1$ is a
+three-pixel box.
+
+<<Win Tests: kernels are normalized>>=
+[Fact]
+public void KernelsAreNormalized()
+{
+    foreach (double r in new[] { 0.0, 0.4, 1, 2.5, 10 })
+    {
+        Helpers.Near(1, Filters.GaussianKernel(r).Sum(), 1e-5, $"gaussian {r}");
+        Helpers.Near(1, Filters.BoxKernel(r).Sum(), 1e-5, $"box {r}");
+    }
+    Assert.Equal(new float[] { 1 }, Filters.BoxKernel(0));
+    Assert.Equal(3, Filters.BoxKernel(1).Length);
+}
+@
+
+The last two tests check the defining behavior of the two nonlinear filters. A $3\times3$ median
+removes an isolated impulse completely: among the nine values in the window only one is the bright
+pixel, and the median is the background, exactly. The noise reduction averages a neighbor only when
+its luminance differs from the center by less than the noise level. A bump of $0.005$ under a level
+of $0.02$ is therefore averaged away, to within $0.002$ of the background, and, not being an edge,
+is not sharpened back.
+
+<<Win Tests: the median and the noise filter>>=
+[Fact]
+public void MedianRemovesAnImpulse()
+{
+    var src = new PixelBuffer(5, 5, new Rgba(0.2f, 0.2f, 0.2f));
+    src[2, 2] = new Rgba(1, 1, 1);
+    var output = Filters.Apply(new FilterKind.Median(), src);
+    Helpers.Near(0.2, output[2, 2].R, 1e-6);
+}
+
+[Fact]
+public void NoiseReductionSmoothsSmallVariations()
+{
+    var src = new PixelBuffer(5, 5, new Rgba(0.5f, 0.5f, 0.5f));
+    src[2, 2] = new Rgba(0.505f, 0.505f, 0.505f);
+    var output = Filters.Apply(new FilterKind.NoiseReduction(0.02, 0.4), src);
+    Assert.True(Math.Abs(output[2, 2].R - 0.5) < 0.002);
+}
+@
+
+\section{Test patterns}
+
+The first three pattern tests are the Swift ones: every pattern has the requested size and stays in
+$[0,1]$; a sine grating of $0.125$ cycles per pixel, sampled along the default line, has its
+spectral peak within one bin of $0.125$, which tests generator, sampler and analyzer together; and
+the checkerboard and the seeded noise are exact and repeatable. Comparing two noise buffers with
+[[Assert.Equal]] works because [[PixelBuffer]] implements value equality over its pixels
+(Chapter~\ref{ch:win-core}), while the class itself is a reference type.
+
+<<Win Tests: test patterns>>=
+public class TestPatternTests
+{
+    [Fact]
+    public void AllPatternsGenerateRequestedSize()
+    {
+        foreach (var kind in TestPatternKindInfo.All)
+        {
+            var buf = TestPatternGenerator.Make(new TestPatternSpec(kind, 64, 48));
+            Assert.Equal(64, buf.Width);
+            Assert.Equal(48, buf.Height);
+            Assert.All(buf.Data, v => Assert.InRange(v, 0f, 1f));
+        }
+    }
+
+    [Fact]
+    public void SineGratingPeaksAtItsFrequency()
+    {
+        var spec = new TestPatternSpec(TestPatternKind.SineGrating, 256, 8, 0.125);
+        var samples = LineSampler.Sample(TestPatternGenerator.Make(spec), LineSegment.Initial);
+        var values = samples.Colors.Select(c => c.R).ToArray();
+        var s = SpectrumAnalyzer.Compute(values, samples.Spacing, WindowFunction.Hann, removeMean: true);
+        int peak = Assert.NotNull(s.PeakIndex);
+        Helpers.Near(0.125, s.CyclesPerPixel[peak], 1.0 / s.FftSize + 1e-9);
+    }
+
+    [Fact]
+    public void CheckerboardAndNoiseDeterminism()
+    {
+        var board = TestPatternGenerator.Make(new TestPatternSpec(TestPatternKind.Checkerboard, 8, 8, 2));
+        Assert.Equal(1, board[0, 0].R);
+        Assert.Equal(0, board[2, 0].R);
+        Assert.Equal(1, board[2, 2].R);
+        var a = TestPatternGenerator.Make(new TestPatternSpec(TestPatternKind.WhiteNoise, 16, 16, 7));
+        var b = TestPatternGenerator.Make(new TestPatternSpec(TestPatternKind.WhiteNoise, 16, 16, 7));
+        Assert.Equal(a, b);
+    }
+
+    <<Win Tests: SplitMix64 reference values>>
+}
+@
+
+The repeatability test only shows that a seed gives the same noise twice on the \emph{same} system.
+The port promises more: the same seed must give the same noise on both systems, so that a noise
+pattern on Windows is the pattern on the Mac. That holds only if the C\# SplitMix64 is bit for bit
+the algorithm of Chapter~\ref{ch:patterns}, with its unsigned 64-bit wrap-around arithmetic, which
+C\# has to be told about with [[ulong]] and unchecked operations. The last test compares the first two
+outputs for seed $0$ with the values of Vigna's reference implementation.
+
+<<Win Tests: SplitMix64 reference values>>=
+[Fact]
+public void SplitMixMatchesReferenceSequence()
+{
+    // Reference values of SplitMix64 seeded with 0 (Vigna's reference implementation).
+    var rng = new SplitMix64(0);
+    Assert.Equal(0xE220A8397B1DCDAFUL, rng.Next());
+    Assert.Equal(0x6E789E6AA1B965F4UL, rng.Next());
+}
+@

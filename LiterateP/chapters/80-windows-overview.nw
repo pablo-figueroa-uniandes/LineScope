@@ -1,0 +1,519 @@
+\part{LineScope for Windows}
+
+\chapter{The Windows Port}\label{ch:win-overview}
+
+Everything so far described LineScope as a macOS program. This part describes its second life: a
+native Windows version, written in C\# for .NET~9 with the Windows Presentation Foundation (WPF)
+and the Windows Imaging Component (WIC)~\cite{wpf}. It has the same three zones, the same shared
+line, the same chained operations, split panes, test patterns and inspector. More importantly, it
+computes the same numbers.
+
+\section{Why a native port}
+
+LineScope is a tool for looking closely at pixels, and that purpose rules out the easy ways of
+running it on Windows. A cross-platform toolkit would put a layer of its own between the image and
+the screen, with its own scaling and color handling, exactly where the program must be precise.
+Rewriting the app in a web technology would have the same problem, and would lose the fast
+numeric loops. The Swift code itself can't be reused: SwiftUI, Core Image, vDSP and Swift Charts
+exist only on Apple platforms.
+
+So the Windows version is a port in the old sense: the same design, rewritten in the native
+language and framework of the other platform. C\# is close enough to Swift that most files
+translate almost line by line. It has value types, generics, closures, [[async]]/[[await]], and
+pattern matching. WPF draws with Direct3D and knows about per-monitor DPI, so one image pixel
+can be put on exactly one screen pixel.
+
+\section{The solution}
+
+A .NET \emph{solution} groups projects, much as the Xcode project groups a package and an app.
+The Windows solution has three, one for each part of the macOS code base:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+macOS & Windows & Contents \\
+\midrule
+[[Packages/LineScopeCore]] & [[Windows/LineScope.Core]] & numeric core, no user interface \\
+[[Packages/LineScopeCore/Tests]] & [[Windows/LineScope.Core.Tests]] & unit tests (xUnit) \\
+[[LineScope]] (the app) & [[Windows/LineScope.App]] & documents, session, windows, menus \\
+\bottomrule
+\end{tabular}
+\end{center}
+The core project targets plain [[net9.0]] and references nothing from WPF, just as
+[[LineScopeCore]] imports no SwiftUI. The app project depends on it; the test project depends only
+on the core. Inside each project the files mirror the Swift ones: [[PixelBuffer.swift]] becomes
+[[PixelBuffer.cs]], [[Resampling.swift]] becomes [[Resampling.cs]], and so on, with the type and
+member names kept and only the capitalization adapted to .NET conventions
+([[TestPatternGenerator.make]] becomes [[TestPatternGenerator.Make]], the property [[lineage]]
+becomes [[Lineage]]).
+
+Where the macOS version leaned on an Apple framework, the port needs a replacement. The table
+summarizes them; the chapters that follow explain each one where it occurs.
+\begin{center}
+\begin{tabular}{@{}p{0.36\textwidth}p{0.58\textwidth}@{}}
+\toprule
+macOS & Windows \\
+\midrule
+SwiftUI [[DocumentGroup(viewing:)]] & one [[MainWindow]] per document, opened by the Open dialog,
+  drag and drop or the command line; the app quits with its last document window \\
+Core Graphics and ImageIO decoding & WIC through [[BitmapDecoder]], converted to premultiplied
+  8-bit BGRA, embedded ICC profiles converted to sRGB \\
+Core Image filters & CPU implementations in [[Filters.cs]] \\
+vDSP real FFT & an iterative radix-2 complex FFT, with the same normalization \\
+Swift Charts & [[ChartView]], drawn with WPF's [[DrawingContext]] \\
+[[@Observable]] [[Session]] & a plain class with a [[Changed]] event carrying flags \\
+[[@FocusedValue]] menus & a menu bar per window, bound to that window's session \\
+points and Retina pixels & 1 image pixel = 1 device-independent pixel (1/96 inch), and a
+  per-monitor DPI-aware process \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Same algorithms, different plumbing}
+
+One rule governs the whole port: \emph{the algorithms stay identical; only the plumbing around them
+changes}. The resampling kernels and their widening when downscaling, the footprint weights of the
+area method, the bilinear line sampler with its $\lceil L\rceil+1$ samples, the color conversions,
+the window functions and the single-sided amplitude normalization, the test-pattern formulas and
+the SplitMix64 generator are all transcribed, not reinvented. The same inputs therefore give the
+same outputs, to floating-point precision, on both systems, and a spectrum measured on a Mac can be
+compared with one measured on a PC.
+
+Two pieces could not be transcribed, because on macOS they were not LineScope's code at all. The
+FFT came from vDSP, and the port brings its own; since only the transform changes and not what is
+done with its output, the spectra still agree. The Gaussian, box, median, unsharp-mask and noise
+reduction filters came from Core Image, whose exact kernels are not documented; the port
+reimplements them on the CPU following Core Image's documented behavior, so their results are
+close to, but not bit-identical with, the macOS ones. Chapter~\ref{ch:win-core} gives the details.
+
+Everything above the core is plumbing, and there the port follows the conventions of Windows
+rather than imitating the Mac: a menu bar in every window, keyboard shortcuts with Ctrl, the
+standard file dialogs, and an application that ends when its last document window closes.
+
+\section{How to read this part}
+
+This part assumes the first. It concentrates on what the port \emph{changes} and why, and refers
+back to the macOS chapters for the theory. Where a C\# file is a faithful transcription of a Swift
+file, its chunks appear with only a short note and a reference to the chapter that explains them;
+where it differs, the difference is discussed. The chunk names all begin with ``Win'', so the index
+keeps the two versions apart.
+
+The chapters follow the order of the first part.
+\begin{description}[style=nextline]
+\item[Chapter~\ref{ch:win-core}] The numeric core, [[LineScope.Core]]: the pixel buffer,
+  resampling, filters, sampling, color models, the spectrum with its FFT, and the test patterns.
+  It is the counterpart of Chapters~\ref{ch:pixels} to~\ref{ch:patterns}.
+\item[Chapter~\ref{ch:win-tests}] The xUnit tests, the counterpart of Chapter~\ref{ch:tests}, with
+  new tests for the FFT and the CPU filters.
+\item[Chapter~\ref{ch:win-model}] Documents, variants and the session, the counterpart of
+  Chapter~\ref{ch:model}.
+\item[Chapter~\ref{ch:win-views}] The windows, zones, panes, image canvas, charts, dialogs and the
+  inspector, and also the menus, which live in each window. It is the counterpart of
+  Chapters~\ref{ch:views} and~\ref{ch:commands}.
+\end{description}
+The rest of this chapter covers the build files and the application object, the counterpart of the
+scenes in [[LineScopeApp]] (Chapter~\ref{ch:model}).
+
+\section{Building}
+
+With the .NET~9 SDK installed, three commands in the [[Windows]] directory build the program, run
+it (optionally on an image given on the command line), and run the tests:
+\begin{lstlisting}[language={}]
+dotnet build LineScope.sln
+dotnet run --project LineScope.App [-- image.png]
+dotnet test LineScope.Core.Tests
+\end{lstlisting}
+Visual Studio 2022 can open the same solution; nothing in the build depends on it.
+
+\subsection{The solution file}
+
+The solution file lists the three projects and maps the solution's configurations onto theirs.
+Its format is older than .NET and not meant to be written by hand: it is maintained with
+[[dotnet sln add]]. The long identifier [[FAE04EC0-...]] is the project-type code for C\#; the other
+three are the projects' own. All six solution configurations (Debug and Release, each for Any CPU,
+x64 and x86) build the projects as Any CPU, since the code is pure managed code and runs on any
+processor. The file starts with an empty line, as Visual Studio writes it.
+
+<<Windows/LineScope.sln>>=
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LineScope.Core", "LineScope.Core\LineScope.Core.csproj", "{D9919667-696E-456F-AB2B-5F9D8C0D562E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LineScope.Core.Tests", "LineScope.Core.Tests\LineScope.Core.Tests.csproj", "{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LineScope.App", "LineScope.App\LineScope.App.csproj", "{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Debug|x64.Build.0 = Debug|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Debug|x86.Build.0 = Debug|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Release|x64.ActiveCfg = Release|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Release|x64.Build.0 = Release|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Release|x86.ActiveCfg = Release|Any CPU
+		{D9919667-696E-456F-AB2B-5F9D8C0D562E}.Release|x86.Build.0 = Release|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Debug|x64.Build.0 = Debug|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Debug|x86.Build.0 = Debug|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Release|x64.ActiveCfg = Release|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Release|x64.Build.0 = Release|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Release|x86.ActiveCfg = Release|Any CPU
+		{8A2D2E5C-6DEC-48FF-9E22-F98D41D13F1D}.Release|x86.Build.0 = Release|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Debug|x64.Build.0 = Debug|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Debug|x86.Build.0 = Debug|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Release|x64.ActiveCfg = Release|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Release|x64.Build.0 = Release|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Release|x86.ActiveCfg = Release|Any CPU
+		{91401FF6-44A6-4F7B-9D1D-241E0FE1896B}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
+@
+
+\subsection{The app project}
+
+The app's project file is short, because the SDK supplies the defaults. [[WinExe]] builds a
+windowed program without a console. The target [[net9.0-windows]] and [[UseWPF]] bring in WPF.
+[[Nullable]] turns on the compiler's null-state analysis, which gives C\# much of the safety of
+Swift's optionals, and [[ImplicitUsings]] imports the common namespaces ([[System]],
+[[System.Linq]], [[System.Collections.Generic]], [[System.Threading.Tasks]]) in every file. The
+assembly is named [[LineScope]], so the program is [[LineScope.exe]], and it references the core
+project.
+
+The core's project file, with its one notable setting (optimization even in Debug, the counterpart
+of the Swift package's [[-O]]), is in Chapter~\ref{ch:win-core}; the test project is in
+Chapter~\ref{ch:win-tests}.
+
+<<Windows/LineScope.App/LineScope.App.csproj>>=
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>LineScope.App</RootNamespace>
+    <AssemblyName>LineScope</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>0.1</Version>
+    <Product>LineScope</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LineScope.Core\LineScope.Core.csproj" />
+  </ItemGroup>
+
+</Project>
+@
+
+\subsection{The application manifest}
+
+The manifest matters more than its size suggests. View \textsf{>} Actual Device Pixels promises one
+image pixel per screen pixel. A process that doesn't declare itself DPI-aware is drawn by Windows at
+96 dots per inch and then stretched as a bitmap to the monitor's scale factor, blurring exactly the
+pixels the user is studying. Declaring \emph{per-monitor} awareness tells Windows that WPF handles
+scaling itself, and keeps doing so when a window moves to a monitor with a different scale. The
+[[dpiAwareness]] element with [[PerMonitorV2]] is read by Windows~10 (version 1703) and later; the
+older [[dpiAware]] element, [[true/PM]], is the fallback for earlier systems. The
+[[supportedOS]] identifier declares compatibility with Windows~10 and~11, so the program gets their
+behavior rather than a compatibility mode.
+
+<<Windows/LineScope.App/app.manifest>>=
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="0.1.0.0" name="LineScope.app"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Per-monitor DPI awareness, so "Actual Device Pixels" maps one image pixel to one screen pixel. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/PM</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
+@
+
+\subsection{Theme information}
+
+The last build file comes from the WPF project template, unchanged. It tells WPF where to look for
+theme-specific resources. LineScope defines no custom controls with themed templates, so the
+attribute only states that there are no theme dictionaries.
+
+<<Windows/LineScope.App/AssemblyInfo.cs>>=
+using System.Windows;
+
+[assembly:ThemeInfo(
+    ResourceDictionaryLocation.None,            //where theme specific resource dictionaries are located
+                                                //(used if a resource is not found in the page,
+                                                // or application resource dictionaries)
+    ResourceDictionaryLocation.SourceAssembly   //where the generic resource dictionary is located
+                                                //(used if a resource is not found in the page,
+                                                // app, or any theme specific resource dictionaries)
+)]
+@
+
+\section{The application object}
+
+A WPF program is an [[Application]] object, usually described in two halves: a XAML file for its
+declarative part and a C\# file for its code. All LineScope's windows are built in C\#
+(Chapter~\ref{ch:win-views}), so [[App.xaml]] is the only XAML in the program and it does little.
+
+It sets two things. The first is the shutdown mode. By default a WPF application ends when its main
+window, the first one opened, closes. LineScope has no main window: it has any number of document
+windows plus two utility windows, the inspector and the pattern generator. With
+[[OnExplicitShutdown]] the application ends only when its code says so, which it does when the last
+\emph{document} window closes. An inspector left open doesn't keep the program alive, and closing
+the first document while others are open doesn't end it. The second is a pair of text styles shared
+by the views: a small gray caption and a semibold section header. The caption uses the system's
+gray-text brush as a [[DynamicResource]], so it follows the Windows colors, including high-contrast
+themes.
+
+There is no [[StartupUri]]: the first window is created in code.
+
+<<Windows/LineScope.App/App.xaml>>=
+<Application x:Class="LineScope.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnExplicitShutdown">
+    <Application.Resources>
+        <Style x:Key="CaptionText" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="Foreground" Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+        </Style>
+        <Style x:Key="SectionHeader" TargetType="TextBlock">
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Margin" Value="0,12,0,4" />
+        </Style>
+    </Application.Resources>
+</Application>
+@
+
+The code half plays the role of [[LineScopeApp]] and its four scenes (Chapter~\ref{ch:model}).
+SwiftUI created and tracked the windows of a scene by itself; here the application object does it.
+
+<<Windows/LineScope.App/App.xaml.cs>>=
+using System.IO;
+using System.Windows;
+using LineScope.App.Model;
+using LineScope.App.Views;
+using LineScope.Core;
+using Microsoft.Win32;
+
+namespace LineScope.App;
+
+/// <summary>
+/// Application entry: one <see cref="MainWindow"/> per document (image file or test pattern), plus the shared
+/// inspector and test-pattern generator windows. The app quits when the last document window closes.
+/// </summary>
+public partial class App : Application
+{
+    <<Win App: shared state>>
+
+    <<Win App: startup>>
+
+    <<Win App: creating a document window>>
+
+    <<Win App: the Open dialog>>
+
+    <<Win App: opening a file>>
+
+    <<Win App: opening a test pattern>>
+
+    <<Win App: the inspector and the pattern generator>>
+}
+@
+
+The application keeps the list of open document windows and the two single utility windows, which
+are [[null]] while closed. [[Current]] hides the base class's property of the same name with one that
+has the right type, so views can write [[App.Current.OpenFile(...)]] without a cast. The file filter
+lists the formats WIC decodes out of the box, plus HEIF and WebP, which it decodes when the Windows
+codec extensions are installed; ``All files'' lets the user try anything else.
+
+<<Win App: shared state>>=
+public static new App Current => (App)Application.Current;
+
+private readonly List<MainWindow> _documentWindows = [];
+private InspectorWindow? _inspector;
+private TestPatternWindow? _generator;
+
+public const string OpenFilter =
+    "Images|*.png;*.jpg;*.jpeg;*.jpe;*.jfif;*.tif;*.tiff;*.bmp;*.dib;*.gif;*.ico;*.wdp;*.jxr;*.heic;*.heif;*.webp;*.dds|All files|*.*";
+@
+
+At startup, every command-line argument that names an existing file is opened in a window of its
+own. This is how LineScope is used from Explorer's ``Open with'' and from a shortcut onto which
+images are dropped. Without files the app shows one empty document window. On macOS the document
+group shows an Open panel instead; an empty window with the menu bar and a hint is the more familiar
+Windows behavior (it offers Open and New Test Pattern buttons), and it gives the user a window to drop files on.
+
+<<Win App: startup>>=
+protected override void OnStartup(StartupEventArgs e)
+{
+    base.OnStartup(e);
+    var files = e.Args.Where(File.Exists).ToList();
+    if (files.Count == 0)
+    {
+        NewDocumentWindow().Show();
+        return;
+    }
+    foreach (var path in files) OpenFile(path, reuse: null);
+}
+@
+
+Every document window, whether it will hold a file or a pattern, is created here, so that the
+application can count them. When the count reaches zero the application shuts down, which is the
+counterpart of the explicit shutdown mode above.
+
+<<Win App: creating a document window>>=
+public MainWindow NewDocumentWindow()
+{
+    var window = new MainWindow();
+    _documentWindows.Add(window);
+    window.Closed += (_, _) =>
+    {
+        _documentWindows.Remove(window);
+        if (_documentWindows.Count == 0) Shutdown();
+    };
+    return window;
+}
+@
+
+File \textsf{>} Open allows several files at once. The first one goes into the window the command
+came from if that window is still empty, so opening a file right after launch doesn't leave an empty
+window behind; the others get new windows. Drag and drop onto a window calls [[OpenFile]] the same
+way (Chapter~\ref{ch:win-views}).
+
+<<Win App: the Open dialog>>=
+/// <summary>Shows the Open dialog and opens every chosen file; the first one goes into <paramref name="reuse"/> if it is empty.</summary>
+public void ShowOpenDialog(MainWindow? reuse)
+{
+    var dialog = new OpenFileDialog { Filter = OpenFilter, Multiselect = true, Title = "Open Image" };
+    if (dialog.ShowDialog(reuse) != true) return;
+    foreach (var path in dialog.FileNames)
+    {
+        OpenFile(path, reuse);
+        reuse = null;
+    }
+}
+@
+
+Opening a file must not freeze the interface, because decoding a large photograph and converting it
+to floats takes a noticeable moment. The window is shown at once with a loading message, and the
+decoding runs on a thread-pool thread with [[Task.Run]]. [[ImageDocument.Load]] is written to be safe
+off the UI thread (Chapter~\ref{ch:win-model}). The [[await]] resumes on the UI thread, where the
+window receives the document and builds its session.
+
+The method is [[async void]], the form C\# reserves for fire-and-forget event handlers: nobody
+awaits it, so it catches its own exceptions. A file that can't be decoded produces a message box.
+The window that was opened for it is then closed, unless it was the empty window being reused or it
+is the only window left, in which case closing it would end the application.
+
+<<Win App: opening a file>>=
+public async void OpenFile(string path, MainWindow? reuse)
+{
+    var window = reuse is { HasDocument: false } ? reuse : NewDocumentWindow();
+    window.ShowLoading($"Opening {Path.GetFileName(path)}…");
+    if (!window.IsVisible) window.Show();
+    window.Activate();
+    try
+    {
+        var document = await Task.Run(() => ImageDocument.Load(path));
+        window.LoadDocument(document, Path.GetFileName(path));
+    }
+    catch (Exception ex)
+    {
+        window.ShowEmpty();
+        MessageBox.Show(window, $"“{Path.GetFileName(path)}” couldn't be opened.\n\n{ex.Message}", "LineScope",
+            MessageBoxButton.OK, MessageBoxImage.Warning);
+        // Keep the empty window if it is the only one, so the app doesn't quit.
+        if (reuse != window && _documentWindows.Count > 1) window.Close();
+    }
+}
+@
+
+A test pattern gets the same kind of window as a file, exactly as on macOS, where
+[[ImageDocument(pattern:)]] let a pattern be shown by the same [[MainView]]. Generating a large
+pattern also takes time, so it runs in the background too. A pattern window isn't restored after a
+relaunch as it is on macOS; Windows has no such mechanism for ordinary programs.
+
+<<Win App: opening a test pattern>>=
+/// <summary>Generates a test pattern in the background and shows it in a new analysis window.</summary>
+public async void OpenPattern(TestPatternSpec spec)
+{
+    var window = NewDocumentWindow();
+    window.Title = spec.Title;
+    window.ShowLoading($"Generating {spec.Kind.DisplayName()}…");
+    window.Show();
+    var document = await Task.Run(() => ImageDocument.FromPattern(spec));
+    window.LoadDocument(document, spec.Title);
+}
+@
+
+The inspector and the pattern generator are single windows, like SwiftUI's [[Window]] scenes. Asking
+for one that is open brings it to the front; asking for one that was closed creates it again. The
+inspector shows whichever session is active (Chapter~\ref{ch:win-model}), so it needs no owner. The
+generator opens a little below and to the right of the window it was requested from, so it doesn't
+appear somewhere unrelated on a multi-monitor desktop.
+
+<<Win App: the inspector and the pattern generator>>=
+public void ShowInspector()
+{
+    if (_inspector is null)
+    {
+        _inspector = new InspectorWindow();
+        _inspector.Closed += (_, _) => _inspector = null;
+        _inspector.Show();
+    }
+    _inspector.Activate();
+}
+
+public void ShowPatternGenerator(Window? owner)
+{
+    if (_generator is null)
+    {
+        _generator = new TestPatternWindow();
+        if (owner is not null)
+        {
+            _generator.WindowStartupLocation = WindowStartupLocation.Manual;
+            _generator.Left = owner.Left + 60;
+            _generator.Top = owner.Top + 60;
+        }
+        _generator.Closed += (_, _) => _generator = null;
+        _generator.Show();
+    }
+    _generator.Activate();
+}
+@

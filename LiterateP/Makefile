@@ -12,7 +12,17 @@ REQUIRE := --require 'Packages/LineScopeCore/Package.swift' \
            --require 'Packages/LineScopeCore/Sources/**/*.swift' \
            --require 'Packages/LineScopeCore/Tests/**/*.swift' \
            --require 'LineScope/**/*.swift' \
-           --require 'project.yml'
+           --require 'project.yml' \
+           --require 'Windows/LineScope.sln' \
+           --require 'Windows/*/*.csproj' \
+           --require 'Windows/LineScope.Core/*.cs' \
+           --require 'Windows/LineScope.Core.Tests/*.cs' \
+           --require 'Windows/LineScope.App/*.cs' \
+           --require 'Windows/LineScope.App/*.xaml' \
+           --require 'Windows/LineScope.App/app.manifest' \
+           --require 'Windows/LineScope.App/Model/*.cs' \
+           --require 'Windows/LineScope.App/Views/*.cs'
+# (The Windows globs stop short of bin/ and obj/, which hold generated C# files.)
 
 .PHONY: all pdf check tangle clean
 

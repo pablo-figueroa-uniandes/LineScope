@@ -1,12 +1,14 @@
 # LineScope: theory and code
 
-LineScope is a macOS tool for *seeing* what resampling and filtering do to an image. You derive copies of an image with different methods and draw one line across them. For every copy the app shows, side by side:
+LineScope is a macOS and Windows tool for *seeing* what resampling and filtering do to an image. You derive copies of an image with different methods and draw one line across them. For every copy the app shows, side by side:
 
 1. **Zone 1:** the image at its true pixel scale, with the line drawn on it.
 2. **Zone 2:** the *profile*, one color channel sampled along the line.
 3. **Zone 3:** the *spectrum*, the Fourier transform of that profile.
 
 This document explains the signal-processing theory behind each of those views, then shows where and how the code implements it. The companion book in [`../LiterateP`](../LiterateP) (`make pdf`) walks through every line of code. This document is about the ideas and how they fit together.
+
+The code links point to the Swift sources of the macOS app. The Windows port in [`../Windows`](../Windows) (C# / .NET 9 / WPF) implements the same algorithms file by file, and each *Code* section ends with a **Windows** bullet that links to the C# counterpart. §10 describes the port and the few places where its numbers differ.
 
 ![LineScope with a zone plate reduced ×0.5 by Mitchell-Netravali, profiles of the copy (left) and the original (right)](images/mitchell-zoneplate.png)
 
@@ -21,10 +23,11 @@ This document explains the signal-processing theory behind each of those views, 
 7. [The spectrum](#7-the-spectrum)
 8. [Test patterns](#8-test-patterns)
 9. [Application architecture](#9-application-architecture)
-10. [Experiments](#10-experiments)
-11. [Limitations and possible extensions](#11-limitations-and-possible-extensions)
-12. [Verification](#12-verification)
-13. [References](#13-references)
+10. [The Windows port](#10-the-windows-port)
+11. [Experiments](#11-experiments)
+12. [Limitations and possible extensions](#12-limitations-and-possible-extensions)
+13. [Verification](#13-verification)
+14. [References](#14-references)
 
 ---
 
@@ -40,7 +43,7 @@ Every other formula in the program (resampling, line sampling, pattern generatio
 
 Two properties of the stored numbers matter:
 
-* **Encoding.** Image files store sRGB-*encoded* values $V \in [0,1]$, which relate to linear light roughly as $L \approx V^{2.2}$. LineScope processes the encoded values directly, so the numbers in the profile are the numbers you see on screen. Section 11 discusses what that means.
+* **Encoding.** Image files store sRGB-*encoded* values $V \in [0,1]$, which relate to linear light roughly as $L \approx V^{2.2}$. LineScope processes the encoded values directly, so the numbers in the profile are the numbers you see on screen. Section 12 discusses what that means.
 * **Alpha.** Transparency is stored *straight*, as $(r, g, b, a)$. Averaging straight colors leaks the color of invisible pixels into their neighbors. Anything that averages pixels therefore first converts to **premultiplied** form $(ar, ag, ab, a)$, averages, and divides by $a$ at the end.
 
 ### Code
@@ -48,7 +51,8 @@ Two properties of the stored numbers matter:
 * [`PixelBuffer`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift) is the single working format: interleaved RGBA `Float32`, row 0 at the top, straight alpha, sRGB-encoded.
 * [`init?(cgImage:)`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift#L96) decodes any image by drawing it into an 8-bit sRGB bitmap context. Core Graphics then performs color conversion from the file's profile. The result is unpremultiplied into floats.
 * [`makeCGImage()`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift#L117) goes the other way for display and PNG export.
-* [`premultiplied()`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift#L60) and [`fromPremultiplied`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift#L71) implement the alpha round trip. The latter also **clamps** to $[0,1]$, which matters for sharpening filters that overshoot (§10.4).
+* [`premultiplied()`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift#L60) and [`fromPremultiplied`](../Packages/LineScopeCore/Sources/LineScopeCore/PixelBuffer.swift#L71) implement the alpha round trip. The latter also **clamps** to $[0,1]$, which matters for sharpening filters that overshoot (§11.4).
+* **Windows:** [`PixelBuffer.cs`](../Windows/LineScope.Core/PixelBuffer.cs) has the same layout and conventions. It is a class, to be treated as immutable. Files are decoded with WIC in [`ImageDocument.Load`](../Windows/LineScope.App/Model/ImageDocument.cs#L39): [`ToSrgbPbgra32`](../Windows/LineScope.App/Model/ImageDocument.cs#L85) converts an embedded ICC profile to sRGB and the pixels to premultiplied BGRA8. [`FromPremultipliedBgra8`](../Windows/LineScope.Core/PixelBuffer.cs#L101) and [`ToPremultipliedBgra8`](../Windows/LineScope.Core/PixelBuffer.cs#L116) bridge in both directions, in place of Core Graphics.
 
 ---
 
@@ -156,7 +160,7 @@ Read the table as follows.
 
 * **Box** lets 30% through at 0.75 cycles/pixel. That is why nearest-neighbor aliases so badly.
 * **Tent** and **Mitchell** are the softest in the passband ($K(0.25) \approx 0.81$–$0.85$).
-* **Lanczos-3** and the **sinc** hold near 1 up to about 0.4 and cut off sharply. The price is ringing: the truncated sinc's ripples (the Gibbs phenomenon) are visible in the dB plot below Nyquist. In the image they appear as bands beside every edge (§10.2).
+* **Lanczos-3** and the **sinc** hold near 1 up to about 0.4 and cut off sharply. The price is ringing: the truncated sinc's ripples (the Gibbs phenomenon) are visible in the dB plot below Nyquist. In the image they appear as bands beside every edge (§11.2).
 
 ### 3.4 Code
 
@@ -165,6 +169,7 @@ All of this is in [`Resampling.swift`](../Packages/LineScopeCore/Sources/LineSco
 * [`contributions(inSize:outSize:method:)`](../Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift#L126) builds, for every output index, the first source index and the normalized weights. It computes $c_i$, the widening $\sigma$ ([line 155](../Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift#L155)), the support, and the kernel argument $(j + \tfrac12 - c_i)/\sigma$ ([line 162](../Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift#L162)). Nearest and Area have their own branches. Zero weights at both ends are trimmed, which keeps the inner loops short.
 * [`kernel(_:_:)`](../Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift#L219) evaluates the kernels above. The two cubics share [`bcSpline`](../Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift#L208). `Resampler.sincRadius = 8`.
 * [`resample(_:width:height:method:)`](../Packages/LineScopeCore/Sources/LineScopeCore/Resampling.swift#L64) premultiplies, runs the horizontal pass into a temporary buffer, runs the vertical pass, and unpremultiplies. The loops use unsafe buffer pointers. The package also compiles with `-O` in Debug ([`Package.swift`](../Packages/LineScopeCore/Package.swift)), because unoptimized pixel loops are tens of times slower.
+* **Windows:** [`Resampling.cs`](../Windows/LineScope.Core/Resampling.cs) is a line-by-line port: [`Contributions`](../Windows/LineScope.Core/Resampling.cs#L112), with the widening $\sigma$ at [line 147](../Windows/LineScope.Core/Resampling.cs#L147) and the kernel argument at [line 154](../Windows/LineScope.Core/Resampling.cs#L154), [`Kernel`](../Windows/LineScope.Core/Resampling.cs#L208) and [`BcSpline`](../Windows/LineScope.Core/Resampling.cs#L198). The core project sets `Optimize` even in Debug, for the same reason as the Swift package's `-O`.
 * The kernels are written out rather than taken from vImage or Core Image on purpose. Library resamplers choose their own kernels and prefilters, and then the menu items wouldn't be the algorithms they name.
 
 ---
@@ -190,7 +195,7 @@ So each filter has a transfer function $H$ that the spectrum zone lets you obser
 | **Emboss** | kernel $\begin{smallmatrix}-2&-1&0\\-1&1&1\\0&1&2\end{smallmatrix}$ | A diagonal derivative plus the identity (weights sum to 1) |
 | **Grayscale** | $Y' = 0.2126R' + 0.7152G' + 0.0722B'$ | Rec. 709 luma on encoded values |
 | **Invert** | $1 - p$ per color channel | – |
-| **Noise reduction** | Core Image `CINoiseReduction` | Edge-preserving smoothing (Apple doesn't document the algorithm) |
+| **Noise reduction** | Core Image `CINoiseReduction` on macOS; a threshold filter on Windows (§4.2) | Edge-preserving smoothing (Apple doesn't document its algorithm) |
 
 ### 4.2 Code
 
@@ -202,7 +207,17 @@ So each filter has a transfer function $H$ that the spectrum zone lets you obser
   * The parameters are Core Image's own. The "radius" of the Gaussian and box blurs is passed straight through, so its exact relation to $\sigma$ or $w$ above is Core Image's convention, not something this code defines.
 * **The CPU** runs [`convolve3x3`](../Packages/LineScopeCore/Sources/LineScopeCore/Filters.swift#L136) for the Laplacian (absolute response) and emboss, and [`sobel`](../Packages/LineScopeCore/Sources/LineScopeCore/Filters.swift#L169) for the gradient magnitude. Both clamp at the image edges and preserve alpha.
 
-Every filter or resample is an [`ImageOperation`](../Packages/LineScopeCore/Sources/LineScopeCore/ImageOperation.swift): a value with a display name and `apply(to:)`. The app records a list of operations for each copy, so operations chain, for example "Gaussian r=2 → Lanczos ×0.5".
+**Windows:** there is no Core Image, so [`Filters.cs`](../Windows/LineScope.Core/Filters.cs) implements every filter on the CPU, on premultiplied data with clamped edges. Here the code defines the parameters:
+* **Gaussian:** $\sigma$ = radius, truncated at $3\sigma$ ([`GaussianKernel`](../Windows/LineScope.Core/Filters.cs#L115)), applied separably ([`ConvolveSeparable`](../Windows/LineScope.Core/Filters.cs#L75)).
+* **Box:** a box over $[-(r+\tfrac12),\ r+\tfrac12]$ with fractional coverage at the ends ([`BoxKernel`](../Windows/LineScope.Core/Filters.cs#L131)). So $r = 1$ is a 3-pixel box, and $w = 2r + 1$ in the table above.
+* **Median:** 3×3 per channel ([`Median3x3`](../Windows/LineScope.Core/Filters.cs#L167)).
+* **Unsharp mask:** $p + \lambda(p - G_\sigma * p)$ with $\sigma$ = radius ([`UnsharpMask`](../Windows/LineScope.Core/Filters.cs#L153)).
+* **Noise reduction:** neighbors whose luminance is within the noise level of the center pixel are averaged, and edge pixels are sharpened by `sharpness` times a 3×3 unsharp mask ([`NoiseReduction`](../Windows/LineScope.Core/Filters.cs#L196)).
+* The 3×3 kernels, [`Convolve3x3`](../Windows/LineScope.Core/Filters.cs#L268) and [`Sobel`](../Windows/LineScope.Core/Filters.cs#L303), are the same as on macOS.
+
+The Gaussian, box, median, unsharp-mask and noise-reduction outputs are therefore close to the macOS ones, but not bit-identical.
+
+Every filter or resample is an [`ImageOperation`](../Packages/LineScopeCore/Sources/LineScopeCore/ImageOperation.swift): a value with a display name and `apply(to:)`. The app records a list of operations for each copy, so operations chain, for example "Gaussian r=2 → Lanczos ×0.5". On Windows it is a C# record in [`ImageOperation.cs`](../Windows/LineScope.Core/ImageOperation.cs).
 
 ---
 
@@ -235,6 +250,7 @@ with indices clamped at the borders. Bilinear interpolation is itself a tent fil
   * See [`hitTest`](../LineScope/Views/ImageCanvas.swift#L53) and [`updatedLine`](../LineScope/Views/ImageCanvas.swift#L62).
   * The start handle is filled and the end handle hollow. The profile's $t = 0$ is the filled end.
 * Images are drawn at **1 image pixel = 1 point**, so a ×0.5 copy looks half as big. *View ▸ Actual Device Pixels* switches to 1 image pixel = 1 screen pixel on Retina displays.
+* **Windows:** [`LineSampler.Sample`](../Windows/LineScope.Core/LineSampler.cs#L35) and [`Bilinear`](../Windows/LineScope.Core/LineSampler.cs#L55) are the same algorithm. The WPF [`ImageCanvas`](../Windows/LineScope.App/Views/ImageCanvas.cs) has the same drag rules ([`HitTest`](../Windows/LineScope.App/Views/ImageCanvas.cs#L127), [`UpdatedLine`](../Windows/LineScope.App/Views/ImageCanvas.cs#L138)) and the same Shift snapping. One image pixel is one DIP (1/96 inch), and *Actual Device Pixels* maps it to one screen pixel at any display scaling.
 
 ---
 
@@ -252,7 +268,7 @@ The profile shows one channel of one color model, chosen in zone 2.
 * **Hue is circular.** Crossing red makes it jump between 360° and 0°. Such jumps are steps in the profile and show up as broadband energy in the spectrum, even though nothing sharp happened in the image. Read hue spectra with that in mind, and prefer S or L for frequency analysis.
 * The chart's y-range is fixed per channel (0–1, or 0–360 for hue), so profiles from different copies can be compared directly.
 
-Code: [`ColorSpaces.swift`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift). See [`hsl(from:)`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift#L35), [`cmyk(from:)`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift#L74) and [`value(of:model:channel:)`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift#L87). The inverse conversions exist for the round-trip tests.
+Code: [`ColorSpaces.swift`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift). See [`hsl(from:)`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift#L35), [`cmyk(from:)`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift#L74) and [`value(of:model:channel:)`](../Packages/LineScopeCore/Sources/LineScopeCore/ColorSpaces.swift#L87). The inverse conversions exist for the round-trip tests. **Windows:** [`ColorSpaces.cs`](../Windows/LineScope.Core/ColorSpaces.cs), with [`Hsl`](../Windows/LineScope.Core/ColorSpaces.cs#L32), [`Cmyk`](../Windows/LineScope.Core/ColorSpaces.cs#L69) and [`Value`](../Windows/LineScope.Core/ColorSpaces.cs#L82).
 
 ---
 
@@ -299,6 +315,8 @@ tapers the ends to zero. It lowers the first sidelobe from about −13 dB (recta
 
 The app computes profiles and spectra on demand, in [`Session.profile(for:)`](../LineScope/Model/Session.swift#L141) and [`spectrum(for:)`](../LineScope/Model/Session.swift#L150). They are cheap (a few thousand points), so they are recomputed on every drag without caching.
 
+**Windows:** [`SpectrumAnalyzer.Compute`](../Windows/LineScope.Core/Spectrum.cs#L40) does the same windowing, padding and normalization, but on a complex FFT of its own, [`Fft.Forward`](../Windows/LineScope.Core/Spectrum.cs#L94). This is an in-place iterative radix-2 Cooley-Tukey transform: a bit-reversal permutation, then $\log_2 N$ stages of butterflies. It takes the real profile as complex numbers with zero imaginary parts, so the output needs none of vDSP's packing or factor-2 scaling, and $A_k = c_k\lvert X_k\rvert / \sum_t w_t$ directly. A unit test checks it against a naive $O(N^2)$ DFT. The session's [`Profile`](../Windows/LineScope.App/Model/Session.cs#L211) and [`Spectrum`](../Windows/LineScope.App/Model/Session.cs#L218) mirror the Swift ones.
+
 ---
 
 ## 8. Test patterns
@@ -324,6 +342,7 @@ Code:
 * [`TestPattern.swift`](../Packages/LineScopeCore/Sources/LineScopeCore/TestPattern.swift) defines the patterns. `TestPatternKind` names each pattern and its single parameter (name, default, range), `TestPatternSpec` is a `Codable` description, and [`TestPatternGenerator.make`](../Packages/LineScopeCore/Sources/LineScopeCore/TestPattern.swift#L93) renders it.
 * In the app, [`ImageDocument(pattern:)`](../LineScope/Document/ImageDocument.swift#L54) wraps the pixels as a document. A `WindowGroup(for: TestPatternSpec.self)` opens it in the same analysis window as a file.
 * The *Custom…* generator window previews the center 256×256 pixels at 1:1.
+* **Windows:** [`TestPattern.cs`](../Windows/LineScope.Core/TestPattern.cs) has the same formulas ([`TestPatternGenerator.Make`](../Windows/LineScope.Core/TestPattern.cs#L102)) and the same [`SplitMix64`](../Windows/LineScope.Core/TestPattern.cs#L215), so a pattern is identical on both platforms. [`ImageDocument.FromPattern`](../Windows/LineScope.App/Model/ImageDocument.cs#L71) opens it in an ordinary `MainWindow`.
 
 ---
 
@@ -366,11 +385,36 @@ Key pieces of the app:
 
 ---
 
-## 10. Experiments
+## 10. The Windows port
+
+[`Windows/`](../Windows) holds a native Windows version of LineScope. It is a .NET 9 solution with three projects that mirror the macOS code.
+
+| Project | Mirrors | Contents |
+|---|---|---|
+| [`LineScope.Core`](../Windows/LineScope.Core/) | `Packages/LineScopeCore` | Everything in §§1–8, file by file, with the same names in PascalCase. No UI dependencies |
+| [`LineScope.Core.Tests`](../Windows/LineScope.Core.Tests) | `LineScopeCoreTests` | An xUnit port of the XCTest suite, plus tests for the FFT and the CPU filters (§13) |
+| [`LineScope.App`](../Windows/LineScope.App/) | `LineScope/` | The WPF app. Views are built in C#; the only XAML is `App.xaml` |
+
+**The same algorithms.** The resampler, line sampler, color conversions, spectrum normalization, test patterns and SplitMix64 are kept identical, so profiles and spectra agree with macOS to floating-point precision. Two pieces had to be written because the Apple frameworks don't exist on Windows: the FFT (§7.3) and the Core Image filters (§4.2). The filters are the only place where the numbers differ.
+
+**Different plumbing.** The app keeps the architecture of §9, with Windows equivalents:
+
+* **Documents.** One `MainWindow` per image or pattern, opened from File ▸ Open, by drag and drop, or from the command line. The app quits when the last one closes. There are no file associations or restored windows.
+* **Session.** [`Session`](../Windows/LineScope.App/Model/Session.cs) owns the same state. In place of `@Observable` it raises a `Changed` event. Its [`SessionChange`](../Windows/LineScope.App/Model/Session.cs#L13) flags say what changed (line, settings, variants, panes, focus, running), and each view redraws only what the flags cover.
+* **Operations** run on the thread pool, with `Task.Run` in [`Perform`](../Windows/LineScope.App/Model/Session.cs#L170), and return to the UI thread. [`Show`](../Windows/LineScope.App/Model/Session.cs#L202) places the new copy in the last pane of each zone, as on macOS.
+* **Menus.** Each `MainWindow` has its own menu bar, bound to its own session, so the `@FocusedValue` fallback of §9 isn't needed. [`ActiveSession`](../Windows/LineScope.App/Model/Session.cs#L265), set when a window is [activated](../Windows/LineScope.App/Views/MainWindow.cs#L48), still drives the inspector. The shortcuts use Ctrl where macOS uses ⌘.
+* **Charts** are drawn with WPF's `DrawingContext` in [`Charts.cs`](../Windows/LineScope.App/Views/Charts.cs), in place of Swift Charts. They keep the fixed y-ranges, the dB floor and the Nyquist rule.
+* **Numbers** are formatted with the current Windows locale. Parameter fields accept either the locale's decimal separator or a period.
+
+[`Windows/README.md`](../Windows/README.md) lists the build commands, the full framework mapping and the shortcuts. Part II of the [literate program](../LiterateP/linescope.pdf) explains every C# file.
+
+---
+
+## 11. Experiments
 
 These recipes turn the theory above into things you can see. Each uses a test pattern (§8).
 
-### 10.1 Aliasing versus prefiltering
+### 11.1 Aliasing versus prefiltering
 
 1. Open **File ▸ New Test Pattern ▸ Zone Plate**.
 2. Apply **Resample ▸ Nearest ×0.5**. Select the *Original* tab again and apply **Area ×0.5**, then **Lanczos-3 ×0.5**.
@@ -378,7 +422,7 @@ These recipes turn the theory above into things you can see. Each uses a test pa
 
 **Nearest** shows false ring centers near the edges: frequencies above the new Nyquist folded back. Its profile keeps full contrast right up to the edges, and its spectrum is full of energy up to 0.5 cycles/pixel. **Lanczos** fades the outer rings to gray, which is correct because those frequencies can't be represented at half size. **Area** sits in between: at ×0.5 it is a box prefilter two source pixels wide. That box's response has the same shape as the *Box* row of §3.3, compressed by half, so it still lets through some energy above the new Nyquist. Set the spectrum axis to *cycles/line* to put the three copies on a common frequency scale.
 
-### 10.2 Ringing versus blur
+### 11.2 Ringing versus blur
 
 Open **Step Edge** and enlarge it ×3 with each kernel. Split zone 2 to put profiles side by side. **Tent** and **Mitchell** give a monotone ramp. **Catmull-Rom** overshoots slightly, **Lanczos-3** more, and the **truncated sinc** rings for many pixels on both sides. That is the Gibbs phenomenon, from the hard truncation of the kernel.
 
@@ -386,31 +430,31 @@ Open **Step Edge** and enlarge it ×3 with each kernel. Split zone 2 to put prof
 
 In the spectrum of the ×3 copy, energy stops at about $0.5/3 \approx 0.167$ cycles/pixel. The copy has three times the samples but no new information.
 
-### 10.3 Measuring a transfer function with noise
+### 11.3 Measuring a transfer function with noise
 
 1. Open **White Noise** and apply **Filter ▸ Gaussian Blur** (radius 2).
 2. Put the line across the image, choose the *Red* channel, set the axis to *cycles/pixel*, and turn on dB.
-3. The original's spectrum is flat (with random scatter). The blurred copy's spectrum falls off like a Gaussian, $H(f) = e^{-2\pi^2\sigma^2 f^2}$. From how fast it falls you can estimate the $\sigma$ that Core Image's radius corresponds to.
+3. The original's spectrum is flat (with random scatter). The blurred copy's spectrum falls off like a Gaussian, $H(f) = e^{-2\pi^2\sigma^2 f^2}$. From how fast it falls you can estimate the $\sigma$ that Core Image's radius corresponds to. On Windows $\sigma$ *is* the radius, so the curve should follow $e^{-8\pi^2 f^2}$, which makes a good check of the port.
 
 A single line is one random realization, so expect scatter of several dB. Longer lines average better.
 
-### 10.4 Sharpening overshoot and clipping
+### 11.4 Sharpening overshoot and clipping
 
 Apply **Sharpen (Unsharp Mask)** to **Linear Chirp** or **Sine Grating**. Mid frequencies are boosted ($H > 1$). Where the boosted signal would exceed $[0,1]$ it is **clipped** when the buffer is stored (§1). The profile then shows flattened peaks, and the spectrum gains harmonics that the filter itself doesn't create.
 
-### 10.5 Leakage
+### 11.5 Leakage
 
 Open **Sine Grating** with a frequency that doesn't fall on a bin, for example 0.13. Switch the window between *Rectangular* and *Hann*. The rectangular window's skirts stay high across the whole band. Hann's drop quickly, as in the figure in §7.2.
 
 ---
 
-## 11. Limitations and possible extensions
+## 12. Limitations and possible extensions
 
 * **Encoded, not linear, light.** Filtering sRGB-encoded values is standard in image editors, but it isn't physically correct. For example, a blur of a black/white edge comes out slightly darker than a blur in linear light would. A "linear light" option would convert with the sRGB transfer function before processing and after.
-* **8-bit decode.** Images are decoded through an 8-bit context, so 16-bit and HDR sources are quantized to 256 levels before analysis.
+* **8-bit decode.** Images are decoded through an 8-bit context (a Core Graphics bitmap on macOS, WIC's BGRA8 on Windows), so 16-bit and HDR sources are quantized to 256 levels before analysis.
 * **EXIF orientation** is ignored on purpose: analysis runs on the stored pixel grid.
-* **Edges** are handled by renormalizing the weights (resampling), clamping (CPU filters) or extending the border (Core Image). Other choices, such as mirror or wrap, would change the first few pixels.
-* **Core Image filters** are Apple's implementations, with Apple's parameter conventions. Only the CPU kernels and the resampler are specified exactly by this code.
+* **Edges** are handled by renormalizing the weights (resampling), clamping (the CPU filters, which on Windows means every filter) or extending the border (Core Image). Other choices, such as mirror or wrap, would change the first few pixels.
+* **Core Image filters** are Apple's implementations, with Apple's parameter conventions. On macOS only the CPU kernels and the resampler are specified exactly by this code. On Windows every filter is (§4.2), but the five Core Image replacements don't match macOS bit for bit.
 * **Naive CMYK**, and a hue channel with a wrap-around discontinuity (§6).
 * Possible additions:
   * a 2-D FFT view;
@@ -420,7 +464,7 @@ Open **Sine Grating** with a frequency that doesn't fall on a bin, for example 0
 
 ---
 
-## 12. Verification
+## 13. Verification
 
 * **Unit tests** (`cd Packages/LineScopeCore && swift test`, 15 tests in [`LineScopeCoreTests.swift`](../Packages/LineScopeCore/Tests/LineScopeCoreTests/LineScopeCoreTests.swift)):
   * the sine peak lands in the right bin with amplitude 1, and the DC amplitude is correct;
@@ -430,12 +474,17 @@ Open **Sine Grating** with a frequency that doesn't fall on a bin, for example 0
   * the line sample count scales with resolution, and samples follow the content;
   * the Core Graphics bridge round-trips, and every filter keeps the image size;
   * every pattern has the requested size and range, the sine grating peaks at its frequency, and noise is reproducible.
-* **Literate program:** `cd LiterateP && make check` tangles the book and confirms it reproduces all 24 source files byte for byte.
-* **Figures:** the plots here are regenerated with `python3 Docs/figures/make_figures.py`. The script uses the same kernel and window formulas as the Swift code.
+* **Windows unit tests** (`cd Windows && dotnet test LineScope.Core.Tests`, 22 tests in [`LineScopeCoreTests.cs`](../Windows/LineScope.Core.Tests/LineScopeCoreTests.cs)):
+  * the 15 above, ported to xUnit, with the Core Graphics round trip replaced by a BGRA8 round trip;
+  * the radix-2 FFT agrees with a naive DFT, and the BGRA channel order is right;
+  * the blur kernels sum to 1, the smoothing filters keep constant images constant, the median removes an impulse, and noise reduction smooths small variations;
+  * SplitMix64 matches a reference sequence.
+* **Literate program:** `cd LiterateP && make check` tangles the book and confirms it reproduces all 54 source files byte for byte, 24 for macOS and 30 for Windows.
+* **Figures:** the plots here are regenerated with `python3 Docs/figures/make_figures.py`. The script uses the same kernel and window formulas as the Swift and C# code.
 
 ---
 
-## 13. References
+## 14. References
 
 1. D. P. Mitchell and A. N. Netravali. "Reconstruction Filters in Computer Graphics." *SIGGRAPH '88*, *Computer Graphics* 22(4):221–228, 1988.
 2. R. G. Keys. "Cubic Convolution Interpolation for Digital Image Processing." *IEEE Trans. ASSP* 29(6):1153–1160, 1981.
@@ -446,3 +495,5 @@ Open **Sine Grating** with a frequency that doesn't fall on a bin, for example 0
 7. R. C. Gonzalez and R. E. Woods. *Digital Image Processing*, 4th ed. Pearson, 2018.
 8. ITU-R Recommendation BT.709, *Parameter values for the HDTV standards* (luma coefficients).
 9. Apple. *Accelerate: vDSP Fast Fourier Transforms* and *Core Image Filter Reference* (developer documentation).
+10. J. W. Cooley and J. W. Tukey. "An Algorithm for the Machine Calculation of Complex Fourier Series." *Mathematics of Computation* 19(90):297–301, 1965.
+11. Microsoft. *Windows Presentation Foundation* and *Windows Imaging Component* (developer documentation).

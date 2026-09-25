@@ -145,5 +145,24 @@ project.yml                   XcodeGen spec
 LineScope/                    the SwiftUI app (document, session model, views, menus)
 Packages/LineScopeCore/       numeric core and tests
 LiterateP/                    literate program: chapters/*.nw, lit.py, linescope.tex, Makefile
+Windows/                      Windows port: LineScope.Core, LineScope.Core.Tests (xUnit), LineScope.App (WPF)
+LiterateP/                    literate program: chapters/*.nw, lit.py, linescope.tex, Makefile
 Docs/                         theory document, figures, screenshots, this summary
 ```
+
+## 9. Addendum: the Windows port (24–25 September 2026)
+
+After the session above, LineScope was ported to Windows, and the documentation was then extended to cover the port.
+
+| Step | Result |
+|---|---|
+| The port (commit `b8f778d`, merged into `main` on 25 September) | `Windows/`: a .NET 9 solution with `LineScope.Core` (a file-by-file C# port of `LineScopeCore`), `LineScope.Core.Tests` (22 xUnit tests, all passing) and `LineScope.App` (WPF). About 4,000 lines of C#, XAML and project files. `Windows/README.md` documents the framework mapping, the shortcuts and the numerical differences |
+| Literate program | Part II, *LineScope for Windows*: five chapters (`80-windows-overview` to `88-windows-views`) whose root chunks tangle to the 30 Windows source files. `lit.py` now sets C# and XML listings, `linescope.tex` defines a C# language and falls back to Consolas when Menlo is missing, and the Makefile requires every Windows source. `make check` covers 54 files |
+| Theory document | A new §10, *The Windows port*. Every *Code* section gains a **Windows** bullet with line-level links to the C# counterpart, and the filters section documents the CPU replacements for Core Image. The verification and references sections were updated, and the later sections renumbered |
+
+What differs on Windows, in brief:
+- The FFT is an in-place radix-2 Cooley-Tukey transform in place of vDSP. A test checks it against a naive DFT.
+- The Core Image filters (Gaussian, box, median, unsharp mask, noise reduction) are reimplemented on the CPU. Their parameters are defined by the code (for example σ = radius), and their output isn't bit-identical to macOS.
+- The rest of the numeric code is unchanged: kernels, sampling, color conversions, spectrum normalization, test patterns and SplitMix64.
+- The UI plumbing is WPF: a `Changed` event with flags in place of `@Observable`, a menu bar per window, and charts drawn with `DrawingContext`.
+- Not ported: file associations and window restoration.

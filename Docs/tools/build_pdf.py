@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Renders Docs/LineScope-Theory-and-Code.md to PDF with headless Google Chrome.
+"""Renders Docs/LineScope-Theory-and-Code.md to PDF with headless Chrome (or Chromium, or Edge).
 
 The Markdown is converted in the page by marked, the $…$ / $$…$$ math by KaTeX and the
 ```mermaid block by Mermaid (all from jsdelivr, so a network connection is needed). Math is
@@ -11,7 +11,9 @@ cut out before Markdown parsing so underscores and backslashes survive.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +22,22 @@ DOCS = Path(__file__).resolve().parent.parent
 SOURCE = DOCS / "LineScope-Theory-and-Code.md"
 OUTPUT = DOCS / "LineScope-Theory-and-Code.pdf"
 PAGE = DOCS / ".print.html"
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# Any Chromium-based browser can print the page. $CHROME overrides the search.
+BROWSERS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "google-chrome", "chromium", "chromium-browser",
+]
+
+
+def find_browser() -> str:
+    for candidate in ([os.environ["CHROME"]] if "CHROME" in os.environ else []) + BROWSERS:
+        if Path(candidate).is_file() or shutil.which(candidate):
+            return candidate
+    raise SystemExit("error: no Chrome, Chromium or Edge found; set $CHROME to the browser's executable")
 
 
 def protect_math(md: str) -> tuple[str, list[tuple[str, bool]]]:
@@ -51,12 +68,12 @@ HTML = """<!doctype html>
 <style>
   @page { size: A4; margin: 18mm 17mm; }
   :root { color-scheme: light; }
-  body { font: 10.5pt/1.5 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: #1b1b1a; }
+  body { font: 10.5pt/1.5 -apple-system, "Helvetica Neue", Helvetica, "Segoe UI", Arial, sans-serif; color: #1b1b1a; }
   h1 { font-size: 22pt; margin: 0 0 .4em; }
   h2 { font-size: 15pt; margin-top: 1.6em; border-bottom: 1px solid #ddd; padding-bottom: .2em; break-after: avoid; }
   h3 { font-size: 12pt; margin-top: 1.2em; break-after: avoid; }
   a { color: #1c5cab; text-decoration: none; }
-  code { font: 9pt Menlo, monospace; background: #f3f2ef; padding: 0 .25em; border-radius: 3px; }
+  code { font: 9pt Menlo, Consolas, monospace; background: #f3f2ef; padding: 0 .25em; border-radius: 3px; }
   pre { background: #f3f2ef; padding: .7em 1em; border-radius: 5px; overflow: hidden; white-space: pre-wrap; }
   pre code { background: none; padding: 0; }
   table { border-collapse: collapse; margin: .8em 0; font-size: 9.5pt; break-inside: avoid; }
@@ -93,7 +110,7 @@ def main() -> int:
     PAGE.write_text(page, encoding="utf-8")
     try:
         subprocess.run(
-            [CHROME, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
+            [find_browser(), "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
              "--virtual-time-budget=20000", "--run-all-compositor-stages-before-draw",
              f"--print-to-pdf={OUTPUT}", PAGE.as_uri()],
             check=True, capture_output=True,

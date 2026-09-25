@@ -32,7 +32,7 @@ swift test --filter SpectrumTests/testSinePeak             # single test
 
 ### Literate program (`LiterateP/`)
 
-The whole codebase is also presented as a noweb-style literate program. `LiterateP/chapters/*.nw` hold LaTeX prose and code chunks. Root chunks are named by repo path and must tangle to the sources byte for byte.
+The whole codebase, Swift and C#, is also presented as a noweb-style literate program. `LiterateP/chapters/*.nw` hold LaTeX prose and code chunks: Part I (chapters `10`–`70`) is the macOS code and Part II (`80`–`88`) the Windows port. Root chunks are named by repo path and must tangle to the sources byte for byte.
 
 **After any source change, update the matching chunk and run `make check`.** It fails on any difference or on an uncovered source file.
 
@@ -41,11 +41,13 @@ cd LiterateP && make check     # tangled web == repository sources
 cd LiterateP && make pdf       # LiterateP/linescope.pdf via tectonic (committed)
 ```
 
+Without `make` (Windows), run `py lit.py check --root .. <the --require globs from the Makefile> chapters/*.nw`. Non-root chunks of Part II are prefixed `Win ` so they don't collide with Part I names.
+
 ### Theory document (`Docs/`)
 
 `Docs/LineScope-Theory-and-Code.md` explains the signal-processing theory and maps it to the code, linking to exact lines (`…swift#L123`).
 - The figures are generated SVGs: run `python3 Docs/figures/make_figures.py`, which needs no dependencies. The script copies the kernel and window formulas from `Resampling.swift` and `Spectrum.swift`, so keep it in sync when they change.
-- When code moves, update the line anchors.
+- When code moves, update the line anchors. Each *Code* section also has a **Windows** bullet that links to the C# files (`…cs#L123`), and §10 describes the port.
 - The committed `Docs/LineScope-Theory-and-Code.pdf` is rebuilt with `python3 Docs/tools/build_pdf.py` (headless Chrome; the CDN needs a network connection). Rebuild it after editing the Markdown.
 
 ## Architecture

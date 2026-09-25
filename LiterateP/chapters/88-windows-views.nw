@@ -1,0 +1,2357 @@
+\chapter{Views and Menus in WPF}\label{ch:win-views}
+
+This chapter is the Windows counterpart of Chapters~\ref{ch:views} and~\ref{ch:commands}. The
+nine files in [[Windows/LineScope.App/Views]] mirror the SwiftUI views one by one: the document
+window with its zones, panes and tabs, the image canvas where the line is drawn, the two charts,
+and the three auxiliary windows (the parameter dialog, the test-pattern generator and the
+inspector). Their \emph{behavior} is meant to be identical, and where it is, this chapter only
+points back to the Swift chapter that explains it. The prose concentrates on what the port had to
+change, and why.
+
+Three changes run through the whole chapter.
+\begin{itemize}
+\item \textbf{Views are built in C\#, without XAML.} Each view is a class deriving from a WPF
+  element ([[Window]], [[DockPanel]], [[ScrollViewer]], [[FrameworkElement]]) whose constructor
+  creates its children. The code then reads much like the SwiftUI [[body]] it replaces, with the
+  same names and the same numbers, and a reader can compare the two side by side. The only XAML in
+  the application is [[App.xaml]] (Chapter~\ref{ch:win-overview}).
+\item \textbf{Redrawing is explicit.} SwiftUI tracks which observable properties a [[body]] reads
+  and redraws exactly those views. WPF has no such mechanism for plain C\# objects. So the
+  [[Session]] of Chapter~\ref{ch:win-model} raises one event, [[Changed]], with a set of
+  [[SessionChange]] flags ([[Line]], [[Settings]], [[Variants]], [[Panes]], [[Focus]],
+  [[Running]]), and every view decides from the flags what it has to update. A line drag, the most
+  frequent change by far, then redraws the line overlays and the charts and nothing else.
+\item \textbf{Menus belong to windows.} A Windows application has no global menu bar. Each
+  document window carries its own, bound to its own session, which removes the whole question
+  of Chapter~\ref{ch:commands} of which document a menu acts on.
+\end{itemize}
+
+\section{Views without XAML}\label{sec:win-views-ui}
+
+A few helpers are shared by several views. They live in [[Ui.cs]], together with the command type
+the menus use.
+
+<<Windows/LineScope.App/Views/Ui.cs>>=
+using System.Globalization;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Media;
+
+namespace LineScope.App.Views;
+
+<<Win Ui.cs: a command for menu items>>
+
+/// <summary>Small helpers for building the views in code.</summary>
+public static class Ui
+{
+    <<Win Ui: secondary text>>
+
+    <<Win Ui: a segmented control>>
+
+    <<Win Ui: parsing a number in either notation>>
+
+    <<Win Ui: a presets button>>
+}
+@ SwiftUI disables a menu item with [[.disabled(session == nil)]], evaluated on every redraw. WPF
+asks an [[ICommand]] instead, through [[CanExecute]]. The [[RelayCommand]] wraps two closures,
+and hooks its [[CanExecuteChanged]] event to the [[CommandManager]]'s [[RequerySuggested]]. WPF
+raises that event after input and focus changes, and the main window raises it explicitly
+([[InvalidateRequerySuggested]]) whenever its session changes. Every menu item is then re-queried
+without any bookkeeping per item. [[Execute]] checks [[CanExecute]] once more, because a keyboard
+shortcut can fire while the menu that would have shown the item as disabled is closed.
+
+<<Win Ui.cs: a command for menu items>>=
+/// <summary>An <see cref="ICommand"/> whose enabled state is re-queried by WPF's command manager.</summary>
+public sealed class RelayCommand(Action execute, Func<bool>? canExecute = null) : ICommand
+{
+    public bool CanExecute(object? parameter) => canExecute?.Invoke() ?? true;
+    public void Execute(object? parameter) { if (CanExecute(parameter)) execute(); }
+
+    public event EventHandler? CanExecuteChanged
+    {
+        add => CommandManager.RequerySuggested += value;
+        remove => CommandManager.RequerySuggested -= value;
+    }
+}
+@ SwiftUI's [[.foregroundStyle(.secondary)]] becomes the system's gray-text brush, which also
+follows the high-contrast themes of Windows.
+
+<<Win Ui: secondary text>>=
+public static Brush SecondaryText => SystemColors.GrayTextBrush;
+
+public static TextBlock Caption(string text) => new()
+{
+    Text = text,
+    FontSize = 11,
+    Foreground = SecondaryText,
+    VerticalAlignment = VerticalAlignment.Center,
+    TextTrimming = TextTrimming.CharacterEllipsis,
+};
+@ WPF has no segmented control, and the profile zone needs two of them (the color model and the
+channel). A row of [[ToggleButton]]s behaves like one if checking a button unchecks the others and
+a checked button can't be unchecked by clicking it again. The negative left margin makes adjacent
+borders overlap, so the buttons read as one control. Reacting to [[Checked]] rather than to
+[[Click]] matters for accessibility: the keyboard and UI Automation toggle the button without
+clicking it.
+
+<<Win Ui: a segmented control>>=
+/// <summary>
+/// A segmented control (like SwiftUI's segmented picker): mutually exclusive toggle buttons.
+/// </summary>
+public static StackPanel Segmented(IReadOnlyList<string> labels, int selected, Action<int> onSelect)
+{
+    var panel = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+    var buttons = new List<ToggleButton>();
+    for (int i = 0; i < labels.Count; i++)
+    {
+        int index = i;
+        var b = new ToggleButton
+        {
+            Content = labels[i],
+            IsChecked = i == selected,
+            Padding = new Thickness(8, 1, 8, 1),
+            Margin = new Thickness(i == 0 ? 0 : -1, 0, 0, 0),
+            MinWidth = 36,
+        };
+        // Checked/Unchecked rather than Click, so keyboard and UI Automation toggles work too.
+        b.Checked += (_, _) =>
+        {
+            foreach (var other in buttons.Where(o => o != b)) other.IsChecked = false;
+            onSelect(index);
+        };
+        b.Unchecked += (_, _) =>
+        {
+            // Clicking the selected segment keeps it selected.
+            if (buttons.All(o => o.IsChecked != true)) b.IsChecked = true;
+        };
+        buttons.Add(b);
+        panel.Children.Add(b);
+    }
+    return panel;
+}
+@ \section{The document window}\label{sec:win-views-window}
+
+[[MainWindow]] replaces [[MainView]] and, with its menu bar, [[LineScopeCommands]] as well. Unlike
+a SwiftUI document window, it can exist without a document: the application opens one empty window
+at start-up, which shows a start screen, and loading an image fills it (the life cycle is in
+Chapter~\ref{ch:win-overview}). The window is a [[DockPanel]] with the menu at the top, a status
+bar at the bottom, and a [[ContentControl]] in between whose content is swapped between the start
+screen, a loading indicator and the three zones.
+
+<<Windows/LineScope.App/Views/MainWindow.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using LineScope.App.Model;
+using LineScope.Core;
+using LineSegment = LineScope.Core.LineSegment;
+
+namespace LineScope.App.Views;
+
+/// <summary>
+/// One document window: the menu bar, the three zones (images, line profile, spectrum) stacked with splitters,
+/// and a status bar. Without a document it shows a start screen.
+/// </summary>
+public sealed class MainWindow : Window
+{
+    <<Win MainWindow: fields>>
+
+    <<Win MainWindow: building the window>>
+
+    // Content states
+
+    <<Win MainWindow: the start screen and the loading state>>
+
+    <<Win MainWindow: loading a document>>
+
+    <<Win MainWindow: reacting to session changes>>
+
+    <<Win MainWindow: dropping files>>
+
+    // Menus
+
+    <<Win MainWindow: the menu bar>>
+
+    <<Win MainWindow: adding a menu item and its shortcut>>
+
+    <<Win MainWindow: running and requesting operations>>
+}
+@ The session is [[null]] until a document is loaded. The progress bar replaces the toolbar
+spinner of the Swift version, and the menu item for Actual Device Pixels is kept in a field because
+its check mark has to be updated from the session.
+
+<<Win MainWindow: fields>>=
+private readonly ContentControl _body = new();
+private readonly StatusBarItem _status = new();
+private readonly ProgressBar _progress = new() { Width = 90, Height = 12, IsIndeterminate = true, Visibility = Visibility.Collapsed };
+private readonly List<ZoneView> _zones = [];
+private MenuItem _devicePixels = null!;
+private Session? _session;
+
+public bool HasDocument => _session is not null;
+@ The minimum size is the one of [[MainView]], and the initial size is limited to the work area,
+so the window fits on a small laptop screen. [[UseLayoutRounding]] snaps element edges to whole
+device pixels, which keeps the image canvas sharp (Section~\ref{sec:win-views-canvas}).
+
+The two window events replace the [[WindowKeyObserver]] of Chapter~\ref{ch:views}. WPF reports
+activation directly, so no invisible helper view is needed. [[Activated]] makes this window's
+session the [[ActiveSession]], which only the inspector still reads, and [[Closed]] withdraws it
+if it is still the active one. The window also accepts files dropped on it.
+
+<<Win MainWindow: building the window>>=
+public MainWindow()
+{
+    Title = "LineScope";
+    var work = SystemParameters.WorkArea;
+    Width = Math.Min(1100, work.Width);
+    Height = Math.Min(900, work.Height);
+    MinWidth = 720;
+    MinHeight = 560;
+    UseLayoutRounding = true;
+    AllowDrop = true;
+    Background = SystemColors.WindowBrush;
+
+    var root = new DockPanel();
+    var menu = BuildMenu();
+    DockPanel.SetDock(menu, Dock.Top);
+    root.Children.Add(menu);
+    var statusBar = new StatusBar { Items = { _status, new StatusBarItem { Content = _progress, HorizontalAlignment = HorizontalAlignment.Right } } };
+    DockPanel.SetDock(statusBar, Dock.Bottom);
+    root.Children.Add(statusBar);
+    root.Children.Add(_body);
+    Content = root;
+
+    Activated += (_, _) => { if (_session is not null) ActiveSession.Current = _session; };
+    Closed += (_, _) => { if (ActiveSession.Current == _session && _session is not null) ActiveSession.Current = null; };
+    Drop += OnDrop;
+    DragOver += (_, e) =>
+    {
+        e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
+    };
+    ShowEmpty();
+}
+@ The start screen offers the two ways to get something to analyze. The loading state is shown
+while an image is decoded or a pattern generated, the counterpart of the [[ProgressView]] of the
+Swift pattern window.
+
+<<Win MainWindow: the start screen and the loading state>>=
+public void ShowEmpty()
+{
+    var open = new Button { Content = "Open Image…", Padding = new Thickness(14, 4, 14, 4), Margin = new Thickness(0, 0, 8, 0) };
+    open.Click += (_, _) => App.Current.ShowOpenDialog(this);
+    var pattern = new Button { Content = "New Test Pattern…", Padding = new Thickness(14, 4, 14, 4) };
+    pattern.Click += (_, _) => App.Current.ShowPatternGenerator(this);
+    _body.Content = new StackPanel
+    {
+        HorizontalAlignment = HorizontalAlignment.Center,
+        VerticalAlignment = VerticalAlignment.Center,
+        Children =
+        {
+            new TextBlock { Text = "LineScope", FontSize = 26, FontWeight = FontWeights.Light, HorizontalAlignment = HorizontalAlignment.Center },
+            new TextBlock
+            {
+                Text = "Open an image (or drop one here) or create a test pattern.", Foreground = Ui.SecondaryText,
+                Margin = new Thickness(0, 6, 0, 16), HorizontalAlignment = HorizontalAlignment.Center,
+            },
+            new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Children = { open, pattern } },
+        },
+    };
+    _status.Content = "";
+}
+
+public void ShowLoading(string message)
+{
+    _body.Content = new StackPanel
+    {
+        HorizontalAlignment = HorizontalAlignment.Center,
+        VerticalAlignment = VerticalAlignment.Center,
+        Children =
+        {
+            new ProgressBar { Width = 160, Height = 6, IsIndeterminate = true, Margin = new Thickness(0, 0, 0, 10) },
+            new TextBlock { Text = message, Foreground = Ui.SecondaryText, HorizontalAlignment = HorizontalAlignment.Center },
+        },
+    };
+}
+@ Loading a document creates the window's one session, as the [[@State]] initializer of
+[[MainView]] does. The session reports failures through an [[Error]] event rather than an
+[[errorMessage]] property, and the window shows them in a message box owned by itself. If the
+window is already active when the document arrives, [[Activated]] won't fire again, so the session
+is made active here; this is the same corner case the Swift observer handles for a window that is
+already key.
+
+<<Win MainWindow: loading a document>>=
+public void LoadDocument(ImageDocument document, string fileName)
+{
+    var session = new Session(document, fileName);
+    _session = session;
+    Title = $"{fileName} — LineScope";
+    session.Changed += OnSessionChanged;
+    session.Error += message =>
+        MessageBox.Show(this, message, "Operation failed", MessageBoxButton.OK, MessageBoxImage.Warning);
+
+    <<Win MainWindow: three zones stacked with splitters>>
+    UpdateStatus();
+    if (IsActive) ActiveSession.Current = session;
+    CommandManager.InvalidateRequerySuggested();
+}
+@ WPF has no [[VSplitView]]. Its equivalent is a [[Grid]] whose rows are separated by thin rows
+holding a [[GridSplitter]], which resizes the rows before and after it. The zones' rows use star
+sizes in the proportions of the Swift ideal heights ($420:220:220$), so they share the window in
+that ratio and keep it when the window is resized, and the minimum heights are the Swift ones.
+
+<<Win MainWindow: three zones stacked with splitters>>=
+var grid = new Grid();
+_zones.Clear();
+double[] ideal = [420, 220, 220];
+double[] min = [180, 140, 140];
+foreach (var zone in ZoneInfo.All)
+{
+    int i = (int)zone;
+    if (i > 0)
+    {
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(5) });
+        var splitter = new GridSplitter
+        {
+            Height = 5, HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch,
+            ResizeBehavior = GridResizeBehavior.PreviousAndNext, ResizeDirection = GridResizeDirection.Rows,
+            Background = SystemColors.ControlDarkBrush,
+        };
+        Grid.SetRow(splitter, grid.RowDefinitions.Count - 1);
+        grid.Children.Add(splitter);
+    }
+    grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(ideal[i], GridUnitType.Star), MinHeight = min[i] });
+    var view = new ZoneView(zone, session);
+    Grid.SetRow(view, grid.RowDefinitions.Count - 1);
+    grid.Children.Add(view);
+    _zones.Add(view);
+}
+_body.Content = grid;
+@ This is the root of the redrawing scheme. The window passes every change down to its zones,
+which pass it on to their panes, and each level looks only at the flags that concern it. The
+window itself updates the menu's check mark when the settings change, and the status bar (which
+names the focused variant, like the dot on its tab) only when an operation starts or ends, the
+focus moves, or a variant is added or closed. Finally, since the change may have enabled or
+disabled menu items, the command manager is asked to re-query them.
+
+<<Win MainWindow: reacting to session changes>>=
+private void OnSessionChanged(SessionChange change)
+{
+    foreach (var zone in _zones) zone.Update(change);
+    if (change.HasFlag(SessionChange.Settings)) _devicePixels.IsChecked = _session?.UseDevicePixels == true;
+    if ((change & (SessionChange.Running | SessionChange.Focus | SessionChange.Variants)) != 0) UpdateStatus();
+    CommandManager.InvalidateRequerySuggested();
+}
+
+private void UpdateStatus()
+{
+    if (_session is null) return;
+    var v = _session.FocusedVariant;
+    _status.Content = $"Focused: {v.Name} · {v.Buffer.Width}×{v.Buffer.Height} px";
+    _progress.Visibility = _session.RunningOperations > 0 ? Visibility.Visible : Visibility.Collapsed;
+}
+@ The first dropped file goes into this window (which replaces its document if it has one) and
+any further files open windows of their own.
+
+<<Win MainWindow: dropping files>>=
+private void OnDrop(object sender, DragEventArgs e)
+{
+    if (e.Data.GetData(DataFormats.FileDrop) is not string[] files) return;
+    MainWindow? reuse = this;
+    foreach (var path in files)
+    {
+        App.Current.OpenFile(path, reuse);
+        reuse = null;
+    }
+}
+@ \section{Menus and shortcuts}\label{sec:win-views-menus}
+
+On macOS the menu bar is global, and Chapter~\ref{ch:commands} needs a focused value, with
+[[ActiveSession]] as a fallback while the inspector is key, to find the document a menu item acts
+on. On Windows each [[MainWindow]] builds its own menu, and every action closes over
+\emph{this} window's [[_session]]. There is nothing to look up. The inspector has no menu bar, so
+the case that required the fallback never arises. The local function [[Has]] plays the role of
+[[.disabled(session == nil)]]: it is the [[CanExecute]] of every item that needs a document.
+
+The menus have the same items in the same order as the Swift ones. What macOS and SwiftUI supply
+by themselves has to be written out here: Open, Close Window and Exit in the File menu. Headers
+carry access keys (the letter after the underscore), so every item is reachable with Alt.
+
+<<Win MainWindow: the menu bar>>=
+private Menu BuildMenu()
+{
+    bool Has() => _session is not null;
+    var menu = new Menu();
+
+    <<Win MainWindow: the File menu>>
+
+    <<Win MainWindow: the Filter menu>>
+
+    <<Win MainWindow: the Resample menu>>
+
+    <<Win MainWindow: the View menu>>
+
+    return menu;
+}
+@ The shortcuts translate the macOS ones by replacing Command with Control and Option with Alt:
+Ctrl+O to open, Ctrl+Alt+N for a custom test pattern, Ctrl+Shift+E to export, Ctrl+W to close
+the window. Command-Delete (Close Tab) becomes Ctrl+Delete. Exit only displays Alt+F4, which the
+system already handles for every window. Test patterns open new windows, so their items don't
+depend on the session at all.
+
+<<Win MainWindow: the File menu>>=
+var file = TopMenu("_File");
+Add(file, "_Open…", () => App.Current.ShowOpenDialog(this), key: new KeyGesture(Key.O, ModifierKeys.Control));
+var patterns = new MenuItem { Header = "New _Test Pattern" };
+foreach (var kind in TestPatternKindInfo.All)
+    Add(patterns, kind.DisplayName(), () => App.Current.OpenPattern(new TestPatternSpec(kind)));
+patterns.Items.Add(new Separator());
+Add(patterns, "_Custom…", () => App.Current.ShowPatternGenerator(this),
+    key: new KeyGesture(Key.N, ModifierKeys.Control | ModifierKeys.Alt));
+file.Items.Add(patterns);
+file.Items.Add(new Separator());
+Add(file, "_Export Image…", () => _session!.ExportFocused(this), Has,
+    new KeyGesture(Key.E, ModifierKeys.Control | ModifierKeys.Shift));
+Add(file, "Close T_ab", () => _session!.CloseVariant(_session.FocusedVariantId),
+    () => _session is { FocusedVariant.IsOriginal: false }, new KeyGesture(Key.Delete, ModifierKeys.Control));
+file.Items.Add(new Separator());
+Add(file, "_Close Window", Close, key: new KeyGesture(Key.W, ModifierKeys.Control));
+Add(file, "E_xit", () => Application.Current.Shutdown(), gestureText: "Alt+F4");
+menu.Items.Add(file);
+@ The Filter and Resample menus are those of Chapter~\ref{ch:commands}, grouped the same way.
+Items ending in an ellipsis [[Request]] parameters first; the others [[Perform]] their filter at
+once.
+
+<<Win MainWindow: the Filter menu>>=
+var filter = TopMenu("F_ilter");
+Add(filter, "_Gaussian Blur…", () => Request(new OperationRequest.GaussianBlur()), Has);
+Add(filter, "_Box Blur…", () => Request(new OperationRequest.BoxBlur()), Has);
+Add(filter, "_Median 3×3", () => Perform(new FilterKind.Median()), Has);
+Add(filter, "_Noise Reduction…", () => Request(new OperationRequest.NoiseReduction()), Has);
+filter.Items.Add(new Separator());
+Add(filter, "_Sharpen (Unsharp Mask)…", () => Request(new OperationRequest.UnsharpMask()), Has);
+Add(filter, "_Edge Detect (Sobel)", () => Perform(new FilterKind.Sobel()), Has);
+Add(filter, "_Laplacian", () => Perform(new FilterKind.Laplacian()), Has);
+Add(filter, "Em_boss", () => Perform(new FilterKind.Emboss()), Has);
+filter.Items.Add(new Separator());
+Add(filter, "G_rayscale", () => Perform(new FilterKind.Grayscale()), Has);
+Add(filter, "_Invert", () => Perform(new FilterKind.Invert()), Has);
+menu.Items.Add(filter);
+@ As in Swift, the Resample menu is generated from the list of methods.
+
+<<Win MainWindow: the Resample menu>>=
+var resample = TopMenu("_Resample");
+foreach (var method in ResampleMethodInfo.All)
+    Add(resample, method.DisplayName() + "…", () => Request(new OperationRequest.Resample(method)), Has);
+menu.Items.Add(resample);
+@ The View menu repeats the zones' split buttons. Actual Device Pixels is a checkable item whose
+[[Checked]] and [[Unchecked]] events write the setting, the counterpart of the [[Binding]] through
+the optional session in Swift. Its check mark is read back when the menu opens and whenever the
+settings change, so it also follows changes made elsewhere. The inspector keeps the conventional
+shortcut, as Ctrl+Alt+I.
+
+<<Win MainWindow: the View menu>>=
+var view = TopMenu("_View");
+foreach (var zone in ZoneInfo.All)
+    Add(view, $"Split {zone.Title()}", () => _session!.Split(zone), Has);
+foreach (var zone in ZoneInfo.All)
+    Add(view, $"Unsplit {zone.Title()}", () => _session!.Unsplit(zone), () => _session?.Panes[(int)zone].Count > 1);
+view.Items.Add(new Separator());
+_devicePixels = new MenuItem { Header = "Actual _Device Pixels", IsCheckable = true };
+_devicePixels.Checked += (_, _) => { if (_session is not null) _session.UseDevicePixels = true; };
+_devicePixels.Unchecked += (_, _) => { if (_session is not null) _session.UseDevicePixels = false; };
+view.SubmenuOpened += (_, _) =>
+{
+    _devicePixels.IsEnabled = Has();
+    _devicePixels.IsChecked = _session?.UseDevicePixels == true;
+};
+view.Items.Add(_devicePixels);
+Add(view, "Reset _Line", () => _session!.Line = LineSegment.Initial, Has);
+view.Items.Add(new Separator());
+Add(view, "Show _Inspector", () => App.Current.ShowInspector(), key: new KeyGesture(Key.I, ModifierKeys.Control | ModifierKeys.Alt));
+menu.Items.Add(view);
+@ In WPF a menu item's [[InputGestureText]] is only a label; it does not make the shortcut work.
+So [[Add]] registers the same command twice: on the menu item, and as a [[KeyBinding]] on the
+window. Because the binding belongs to the window, the shortcut acts on this window's session and
+only while this window is active, which is exactly the scope of its menu. The label is generated
+from the gesture, in the user's language.
+
+<<Win MainWindow: adding a menu item and its shortcut>>=
+private static MenuItem TopMenu(string header) => new() { Header = header };
+
+private void Add(MenuItem parent, string header, Action action, Func<bool>? canExecute = null, KeyGesture? key = null,
+    string? gestureText = null)
+{
+    var command = new RelayCommand(action, canExecute);
+    var item = new MenuItem { Header = header, Command = command };
+    if (key is not null)
+    {
+        InputBindings.Add(new KeyBinding(command, key));
+        item.InputGestureText = key.GetDisplayStringForCulture(System.Globalization.CultureInfo.CurrentUICulture);
+    }
+    else if (gestureText is not null)
+    {
+        item.InputGestureText = gestureText;
+    }
+    parent.Items.Add(item);
+}
+@ SwiftUI presents the parameter sheet in reaction to the session's [[pendingRequest]]. A modal
+WPF dialog is simpler: [[ShowDialog]] returns only when the dialog is closed, so the request is a
+local value, and the operation built by the dialog runs right after it. The session needs no
+pending-request state at all.
+
+<<Win MainWindow: running and requesting operations>>=
+private void Perform(FilterKind filter) => _session?.Perform(new ImageOperation.Filter(filter));
+
+private void Request(OperationRequest request)
+{
+    if (_session is null) return;
+    var dialog = new ParameterDialog(request, _session) { Owner = this };
+    if (dialog.ShowDialog() == true && dialog.Operation is { } op) _session.Perform(op);
+}
+@ \section{Zones}\label{sec:win-views-zones}
+
+A zone is laid out as in Chapter~\ref{ch:views}: a header bar with the title on the left, the
+split buttons on the right and the zone's own controls next to them, above one or more panes side
+by side. The difference is in how it stays current. SwiftUI rebuilds [[ZoneView.body]] whenever
+something it reads changes; the WPF zone is built once and then patched by [[Update]].
+
+<<Windows/LineScope.App/Views/ZoneView.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using LineScope.App.Model;
+using LineScope.Core;
+using LineSegment = LineScope.Core.LineSegment;
+
+namespace LineScope.App.Views;
+
+/// <summary>One horizontal zone: a header with its controls, and one or more side-by-side panes.</summary>
+public sealed class ZoneView : DockPanel
+{
+    <<Win ZoneView: fields>>
+
+    <<Win ZoneView: the header row>>
+
+    <<Win ZoneView: updating from session changes>>
+
+    <<Win ZoneView: side-by-side panes with splitters>>
+
+    <<Win ZoneView: controls specific to each zone>>
+
+    <<Win ZoneView: a combo box and a check box>>
+
+    <<Win ZoneView: split and unsplit buttons>>
+
+    <<Win ZoneView: describing the line>>
+}
+@ The fields keep the elements that later updates touch: the pane views, the line description,
+the Unsplit button, and the color model the controls were built for.
+
+<<Win ZoneView: fields>>=
+private readonly Zone _zone;
+private readonly Session _session;
+private readonly Grid _panesGrid = new();
+private readonly List<PaneView> _panes = [];
+private readonly StackPanel _controls = new() { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+private TextBlock? _lineText;
+private Button _unsplit = null!;
+private ColorModel _builtFor;
+@ The header is a [[DockPanel]] with [[LastChildFill]] off. Children docked to the right are placed
+from the right edge inward in the order they are added, so the split buttons come first, then
+the divider, then the controls; the free space between the title and the controls plays the role
+of the SwiftUI [[Spacer]].
+
+<<Win ZoneView: the header row>>=
+public ZoneView(Zone zone, Session session)
+{
+    _zone = zone;
+    _session = session;
+
+    var header = new DockPanel { Margin = new Thickness(10, 4, 10, 4), LastChildFill = false };
+    var title = new TextBlock
+    {
+        Text = zone.Title(), FontWeight = FontWeights.SemiBold, FontSize = 13, VerticalAlignment = VerticalAlignment.Center,
+    };
+    SetDock(title, Dock.Left);
+    header.Children.Add(title);
+    var splitButtons = SplitButtons();
+    SetDock(splitButtons, Dock.Right);
+    header.Children.Add(splitButtons);
+    var divider = new Border
+    {
+        Width = 1, Height = 16, Margin = new Thickness(10, 0, 10, 0), Background = SystemColors.ControlDarkBrush,
+    };
+    SetDock(divider, Dock.Right);
+    header.Children.Add(divider);
+    SetDock(_controls, Dock.Right);
+    header.Children.Add(_controls);
+
+    var bar = new Border
+    {
+        Child = header,
+        Background = SystemColors.ControlBrush,
+        BorderBrush = SystemColors.ControlDarkBrush,
+        BorderThickness = new Thickness(0, 0, 0, 1),
+    };
+    SetDock(bar, Dock.Top);
+    Children.Add(bar);
+    Children.Add(_panesGrid);
+
+    BuildControls();
+    RebuildPanes();
+}
+@ The zone rebuilds its panes only when their \emph{number} changed. A pane showing a different
+variant is updated in place by the pane itself. Its line description changes with the line. Its
+controls are rebuilt only when the color model changed, because only then does the list of
+channels change (RGBA has four, HSL three). Other settings leave the controls alone, which matters
+because a control that is rebuilt while the user operates it would lose its keyboard focus.
+
+<<Win ZoneView: updating from session changes>>=
+public void Update(SessionChange change)
+{
+    if (change.HasFlag(SessionChange.Panes) && _session.Panes[(int)_zone].Count != _panes.Count)
+        RebuildPanes();
+    foreach (var pane in _panes) pane.Update(change);
+    if (change.HasFlag(SessionChange.Line) && _lineText is not null) _lineText.Text = LineDescription();
+    if (change.HasFlag(SessionChange.Settings) && _zone == Zone.Profile && _builtFor != _session.ColorModel)
+        BuildControls();
+    _unsplit.IsEnabled = _session.Panes[(int)_zone].Count > 1;
+}
+@ Split panes use the same device as the zones, turned by ninety degrees: a [[Grid]] of equal star
+columns separated by five-pixel columns with a vertical [[GridSplitter]]. The minimum width of 200
+is the one [[PaneView]] has in the Swift [[HSplitView]]. Rebuilding the columns after a split
+gives every pane an equal share of the width again.
+
+<<Win ZoneView: side-by-side panes with splitters>>=
+private void RebuildPanes()
+{
+    _panesGrid.Children.Clear();
+    _panesGrid.ColumnDefinitions.Clear();
+    _panes.Clear();
+    int count = _session.Panes[(int)_zone].Count;
+    for (int i = 0; i < count; i++)
+    {
+        if (i > 0)
+        {
+            _panesGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(5) });
+            var splitter = new GridSplitter
+            {
+                Width = 5, HorizontalAlignment = HorizontalAlignment.Stretch, ResizeBehavior = GridResizeBehavior.PreviousAndNext,
+                Background = SystemColors.ControlBrush,
+            };
+            Grid.SetColumn(splitter, _panesGrid.ColumnDefinitions.Count - 1);
+            _panesGrid.Children.Add(splitter);
+        }
+        _panesGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 200 });
+        var pane = new PaneView(_zone, i, _session);
+        Grid.SetColumn(pane, _panesGrid.ColumnDefinitions.Count - 1);
+        _panesGrid.Children.Add(pane);
+        _panes.Add(pane);
+    }
+}
+@ The controls of each zone are those of Chapter~\ref{ch:views}, created in a [[switch]] instead
+of a [[@ViewBuilder]]. The SwiftUI bindings ([[$session.window]] and the like) become callbacks
+that assign the session's property; the session's setter raises [[Changed]] and the rest follows.
+
+<<Win ZoneView: controls specific to each zone>>=
+private void BuildControls()
+{
+    _controls.Children.Clear();
+    _lineText = null;
+    _builtFor = _session.ColorModel;
+    switch (_zone)
+    {
+        case Zone.Images:
+            <<Win ZoneView: image-zone controls>>
+
+        case Zone.Profile:
+            <<Win ZoneView: profile-zone controls>>
+
+        case Zone.Spectrum:
+            <<Win ZoneView: spectrum-zone controls>>
+    }
+}
+@ The line description is set in Consolas, the Windows stand-in for the monospaced digits of the
+Swift caption, so the text doesn't jitter while the line is dragged.
+
+<<Win ZoneView: image-zone controls>>=
+_lineText = new TextBlock
+{
+    Text = LineDescription(), FontFamily = new FontFamily("Consolas"), FontSize = 11.5,
+    Foreground = Ui.SecondaryText, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0),
+};
+_controls.Children.Add(_lineText);
+var reset = new Button { Content = "Reset Line", Padding = new Thickness(8, 1, 8, 1) };
+reset.Click += (_, _) => _session.Line = LineSegment.Initial;
+_controls.Children.Add(reset);
+break;
+@ The two segmented pickers of the profile zone use [[Ui.Segmented]]; the channel labels come
+from the current color model.
+
+<<Win ZoneView: profile-zone controls>>=
+var models = Ui.Segmented(ColorModelInfo.All.Select(m => m.DisplayName()).ToList(),
+    Array.IndexOf(ColorModelInfo.All, _session.ColorModel), i => _session.ColorModel = ColorModelInfo.All[i]);
+models.Margin = new Thickness(0, 0, 12, 0);
+models.ToolTip = "Color space";
+_controls.Children.Add(models);
+var channels = Ui.Segmented(_session.ColorModel.Channels(), _session.ChannelIndex, i => _session.ChannelIndex = i);
+channels.ToolTip = "Channel";
+_controls.Children.Add(channels);
+break;
+@ The spectrum zone's pop-up pickers become combo boxes, and its toggles check boxes.
+
+<<Win ZoneView: spectrum-zone controls>>=
+_controls.Children.Add(Combo("Window", WindowFunctionInfo.All.Select(w => w.DisplayName()).ToList(),
+    Array.IndexOf(WindowFunctionInfo.All, _session.Window), i => _session.Window = WindowFunctionInfo.All[i]));
+_controls.Children.Add(Combo("Axis", FrequencyAxisInfo.All.Select(a => a.DisplayName()).ToList(),
+    Array.IndexOf(FrequencyAxisInfo.All, _session.FrequencyAxis), i => _session.FrequencyAxis = FrequencyAxisInfo.All[i]));
+_controls.Children.Add(Check("Remove mean", _session.RemoveMean, v => _session.RemoveMean = v));
+_controls.Children.Add(Check("dB", _session.LogMagnitude, v => _session.LogMagnitude = v));
+break;
+@ A combo box reports a selected index of $-1$ while its items are being replaced, which must not
+reach the session.
+
+<<Win ZoneView: a combo box and a check box>>=
+private static StackPanel Combo(string label, List<string> items, int selected, Action<int> onSelect)
+{
+    var combo = new ComboBox { ItemsSource = items, SelectedIndex = selected, MinWidth = 90, Padding = new Thickness(6, 1, 6, 1) };
+    combo.SelectionChanged += (_, _) => { if (combo.SelectedIndex >= 0) onSelect(combo.SelectedIndex); };
+    return new StackPanel
+    {
+        Orientation = Orientation.Horizontal,
+        Margin = new Thickness(0, 0, 12, 0),
+        Children =
+        {
+            new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) },
+            combo,
+        },
+    };
+}
+
+private static CheckBox Check(string label, bool value, Action<bool> onChange)
+{
+    var box = new CheckBox { Content = label, IsChecked = value, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) };
+    box.Checked += (_, _) => onChange(true);
+    box.Unchecked += (_, _) => onChange(false);
+    return box;
+}
+@ The split buttons have text labels instead of SF Symbols, which don't exist on Windows. WPF
+hides the tooltip of a disabled element by default, so it is turned on explicitly for Unsplit:
+a grayed-out button should still say what it would do.
+
+<<Win ZoneView: split and unsplit buttons>>=
+private StackPanel SplitButtons()
+{
+    var split = new Button { Content = "Split", Padding = new Thickness(8, 1, 8, 1), ToolTip = $"Split: add a pane to {_zone.Title()}" };
+    split.Click += (_, _) => _session.Split(_zone);
+    _unsplit = new Button
+    {
+        Content = "Unsplit", Padding = new Thickness(8, 1, 8, 1), Margin = new Thickness(4, 0, 0, 0),
+        ToolTip = "Unsplit: remove the last pane", IsEnabled = _session.Panes[(int)_zone].Count > 1,
+    };
+    ToolTipService.SetShowOnDisabled(_unsplit, true);
+    _unsplit.Click += (_, _) => _session.Unsplit(_zone);
+    return new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Children = { split, _unsplit } };
+}
+@ [[Fmt.Fixed]] (Chapter~\ref{ch:win-model}) formats with three decimals in the user's locale,
+like [[.number.precision(.fractionLength(3))]] in Swift.
+
+<<Win ZoneView: describing the line>>=
+private string LineDescription()
+{
+    var l = _session.Line;
+    static string P(double v) => Fmt.Fixed(v, 3);
+    return $"({P(l.Start.X)}, {P(l.Start.Y)}) → ({P(l.End.X)}, {P(l.End.Y)})";
+}
+@ \section{Panes and tabs}\label{sec:win-views-panes}
+
+A pane is a strip of tabs above the zone's content, as in Chapter~\ref{ch:views}. The content
+element (canvas or chart) is created once, and later only told which variant to show.
+
+<<Windows/LineScope.App/Views/PaneView.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using LineScope.App.Model;
+
+namespace LineScope.App.Views;
+
+/// <summary>A tab strip listing every variant, plus the zone's content for the selected one.</summary>
+public sealed class PaneView : DockPanel
+{
+    <<Win PaneView: fields>>
+
+    <<Win PaneView: tab strip above the zone's content>>
+
+    <<Win PaneView: which variant this pane shows>>
+
+    <<Win PaneView: updating from session changes>>
+
+    <<Win PaneView: the tab strip>>
+}
+@ A pane knows its zone, its index in the zone and the session, as the Swift [[PaneView]] does,
+and in addition keeps its tab row and its content element.
+
+<<Win PaneView: fields>>=
+private readonly Zone _zone;
+private readonly int _paneIndex;
+private readonly Session _session;
+private readonly StackPanel _tabs = new() { Orientation = Orientation.Horizontal, Margin = new Thickness(6, 3, 6, 3) };
+private readonly FrameworkElement _content;
+@ The tab strip is a [[ScrollViewer]] with its scroll bar hidden, like the SwiftUI
+[[ScrollView]] without indicators. A mouse without a horizontal wheel could not scroll it, so the
+vertical wheel is redirected to scroll sideways.
+
+<<Win PaneView: tab strip above the zone's content>>=
+public PaneView(Zone zone, int paneIndex, Session session)
+{
+    _zone = zone;
+    _paneIndex = paneIndex;
+    _session = session;
+    LastChildFill = true;
+
+    var strip = new ScrollViewer
+    {
+        HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
+        VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+        Content = _tabs,
+        Focusable = false,
+    };
+    strip.PreviewMouseWheel += (_, e) =>
+    {
+        strip.ScrollToHorizontalOffset(strip.HorizontalOffset - e.Delta / 2.0);
+        e.Handled = true;
+    };
+    SetDock(strip, Dock.Top);
+    Children.Add(strip);
+    var divider = new Border { Height = 1, Background = SystemColors.ControlDarkBrush, Opacity = 0.5 };
+    SetDock(divider, Dock.Top);
+    Children.Add(divider);
+
+    var variant = SelectedVariant;
+    _content = zone switch
+    {
+        Zone.Images => new ImageCanvas(session, variant),
+        Zone.Profile => new ProfileChart(session, variant),
+        _ => new SpectrumChart(session, variant),
+    };
+    Children.Add(_content);
+    RebuildTabs();
+}
+@ The selection is looked up in the session with the same fallbacks as in Swift.
+
+<<Win PaneView: which variant this pane shows>>=
+private ImageVariant SelectedVariant
+{
+    get
+    {
+        var panes = _session.Panes[(int)_zone];
+        var id = _paneIndex < panes.Count ? panes[_paneIndex].VariantId : _session.Original.Id;
+        return _session.Variant(id) ?? _session.Original;
+    }
+}
+@ Here the flags are sorted out in detail. The tabs depend on the list of variants, on the pane's
+selection and on the focus (the dot), so those three rebuild them and hand the content its
+variant; the canvas is only given a new variant if it actually changed, because that resets its
+bitmap. Then the content reacts to what it shows. The canvas redraws only its line overlay when
+the line moves, and resizes when the settings change (Actual Device Pixels is a setting). A chart
+depends on the line, on all settings (channel, window, axis, dB) and on its variant, and simply
+invalidates its visual: WPF calls [[OnRender]] again before the next frame.
+
+<<Win PaneView: updating from session changes>>=
+public void Update(SessionChange change)
+{
+    if ((change & (SessionChange.Variants | SessionChange.Panes | SessionChange.Focus)) != 0)
+    {
+        RebuildTabs();
+        var variant = SelectedVariant;
+        switch (_content)
+        {
+            case ImageCanvas canvas when canvas.Variant != variant: canvas.Variant = variant; break;
+            case ProfileChart chart: chart.Variant = variant; break;
+            case SpectrumChart chart: chart.Variant = variant; break;
+        }
+    }
+    switch (_content)
+    {
+        case ImageCanvas canvas:
+            if (change.HasFlag(SessionChange.Line)) canvas.RefreshLine();
+            if (change.HasFlag(SessionChange.Settings)) canvas.UpdateSize();
+            break;
+        case ChartView chart:
+            if ((change & (SessionChange.Line | SessionChange.Settings | SessionChange.Variants | SessionChange.Panes)) != 0)
+                chart.InvalidateVisual();
+            break;
+    }
+}
+@ Tabs are few and cheap, so they are simply rebuilt.
+
+<<Win PaneView: the tab strip>>=
+private void RebuildTabs()
+{
+    _tabs.Children.Clear();
+    var selectedId = SelectedVariant.Id;
+    foreach (var v in _session.Variants)
+        _tabs.Children.Add(Tab(v, v.Id == selectedId));
+}
+
+private Border Tab(ImageVariant v, bool selected)
+{
+    <<Win PaneView: a tab's label>>
+
+    <<Win PaneView: a tab's context menu>>
+    return tab;
+}
+@ A tab shows the same things as in Swift: the focus dot, the name and the pixel size, on a tinted
+rounded background when the pane shows this variant. The tint is the system highlight color at
+22\% opacity (alpha $56/255$), the accent color's opacity in Swift. A click selects the variant,
+which also focuses it.
+
+<<Win PaneView: a tab's label>>=
+var row = new StackPanel { Orientation = Orientation.Horizontal };
+if (v.Id == _session.FocusedVariantId)
+{
+    row.Children.Add(new Ellipse
+    {
+        Width = 5, Height = 5, Fill = SystemColors.HighlightBrush,
+        Margin = new Thickness(0, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center,
+    });
+}
+row.Children.Add(new TextBlock { Text = v.Name, FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center });
+row.Children.Add(new TextBlock
+{
+    Text = $"{v.Buffer.Width}×{v.Buffer.Height}", FontSize = 11.5, Foreground = Ui.SecondaryText,
+    Margin = new Thickness(4, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center,
+});
+
+var highlight = SystemColors.HighlightColor;
+var tab = new Border
+{
+    Child = row,
+    Padding = new Thickness(8, 3, 8, 3),
+    Margin = new Thickness(0, 0, 2, 0),
+    CornerRadius = new CornerRadius(5),
+    Background = selected
+        ? new SolidColorBrush(Color.FromArgb(56, highlight.R, highlight.G, highlight.B))
+        : Brushes.Transparent,
+    ToolTip = v.Name,
+    Cursor = Cursors.Hand,
+};
+tab.MouseLeftButtonUp += (_, _) => _session.Select(v.Id, _zone, _paneIndex);
+@ The context menu is the Swift one. Export needs a window to own its save dialog, and the pane
+finds its own.
+
+<<Win PaneView: a tab's context menu>>=
+var menu = new ContextMenu();
+var export = new MenuItem { Header = "Export Image…" };
+export.Click += (_, _) =>
+{
+    _session.Select(v.Id, _zone, _paneIndex);
+    _session.ExportFocused(Window.GetWindow(this));
+};
+var close = new MenuItem { Header = "Close Tab", IsEnabled = !v.IsOriginal };
+close.Click += (_, _) => _session.CloseVariant(v.Id);
+menu.Items.Add(export);
+menu.Items.Add(close);
+tab.ContextMenu = menu;
+@ \section{The image canvas}\label{sec:win-views-canvas}
+
+The canvas has the same job as in Chapter~\ref{ch:views}: show a variant at its true scale and
+let the user drag the shared line, with the same four drag modes, the same hit-test radii and the
+same Shift snapping. What changes is the unit of true scale, and the gesture, which WPF doesn't
+provide and which is therefore assembled from mouse events.
+
+<<Windows/LineScope.App/Views/ImageCanvas.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using LineScope.App.Model;
+using LineScope.Core;
+using LineSegment = LineScope.Core.LineSegment;
+
+namespace LineScope.App.Views;
+
+/// <summary>
+/// Shows a variant at its true scale (1 image pixel = 1 DIP, or 1 device pixel) with scrolling,
+/// and lets the user drag the shared selection line.
+/// </summary>
+public sealed class ImageCanvas : ScrollViewer
+{
+    <<Win ImageCanvas: fields and the state of a drag>>
+
+    <<Win ImageCanvas: the scrolling surface>>
+
+    <<Win ImageCanvas: showing a variant>>
+
+    <<Win ImageCanvas: image pixels and DIPs>>
+
+    // Mouse handling
+
+    <<Win ImageCanvas: the mouse handlers>>
+
+    <<Win ImageCanvas: hit testing the line>>
+
+    <<Win ImageCanvas: updating the line during a drag>>
+
+    <<Win ImageCanvas: Shift snapping>>
+
+    <<Win ImageCanvas: coordinate conversions>>
+}
+
+<<Win ImageCanvas.cs: the line overlay>>
+@ The Swift [[DragState]] becomes three fields. [[_pressPoint]] is set while the button is down,
+[[_dragMode]] once the drag has been recognized, and [[_dragInitial]] is the line as it was then,
+from which every update is computed.
+
+<<Win ImageCanvas: fields and the state of a drag>>=
+private readonly Session _session;
+private readonly Grid _surface;
+private readonly Image _image;
+private readonly LineOverlay _overlay;
+private ImageVariant _variant;
+
+private enum DragMode { Start, End, Whole, Draw }
+private Point? _pressPoint;
+private DragMode? _dragMode;
+private LineSegment _dragInitial;
+@ The structure is the SwiftUI one: a scroll view containing a fixed-size surface that holds the
+image and the line overlay. The surface is centered, so a small image sits in the middle of the
+pane, and the mouse handlers are attached to the surface, so that positions are image coordinates
+regardless of scrolling and margins. Its transparent background makes all of it hit-testable,
+like [[.contentShape(Rectangle())]]. The image is stretched to exactly the surface's size with
+nearest-neighbor scaling, the WPF spelling of [[.interpolation(.none)]].
+
+Losing the mouse capture (to a message box, say, or Alt+Tab) ends a drag as surely as releasing
+the button. [[Loaded]] sizes the surface again once the canvas knows the monitor it is on.
+
+<<Win ImageCanvas: the scrolling surface>>=
+public ImageCanvas(Session session, ImageVariant variant)
+{
+    _session = session;
+    _variant = variant;
+    HorizontalScrollBarVisibility = ScrollBarVisibility.Auto;
+    VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+    Background = SystemColors.AppWorkspaceBrush;
+    Focusable = false;
+
+    _image = new Image { Stretch = Stretch.Fill };
+    RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.NearestNeighbor);
+    _overlay = new LineOverlay { IsHitTestVisible = false };
+    _surface = new Grid
+    {
+        HorizontalAlignment = HorizontalAlignment.Center,
+        VerticalAlignment = VerticalAlignment.Center,
+        Background = Brushes.Transparent,
+        Cursor = Cursors.Cross,
+        Children = { _image, _overlay },
+    };
+    Content = _surface;
+
+    _surface.MouseLeftButtonDown += OnDown;
+    _surface.MouseMove += OnMove;
+    _surface.MouseLeftButtonUp += OnUp;
+    _surface.LostMouseCapture += (_, _) => { _pressPoint = null; _dragMode = null; };
+
+    Loaded += (_, _) => UpdateSize();
+    Refresh();
+}
+@ Changing the variant replaces the bitmap and the size; a moving line only touches the overlay.
+The variant's [[Bitmap]] is the frozen 8-bit bridge of Chapter~\ref{ch:win-model}, made once per
+variant.
+
+<<Win ImageCanvas: showing a variant>>=
+public ImageVariant Variant
+{
+    get => _variant;
+    set { _variant = value; Refresh(); }
+}
+
+public void Refresh()
+{
+    _image.Source = _variant.Bitmap;
+    UpdateSize();
+    _overlay.Line = _session.Line;
+}
+
+public void RefreshLine() => _overlay.Line = _session.Line;
+@ WPF measures in \emph{device-independent pixels} (DIPs) of $1/96$ inch, the role points play on
+macOS. At 100\,\% display scaling a DIP is one device pixel; at 150\,\% it is one and a half. By
+default one image pixel is one DIP, so an image looks the same physical size on every monitor,
+just as one pixel per point does on a Mac. With Actual Device Pixels, the surface is made smaller
+by the monitor's scale factor, which maps each image pixel onto exactly one device pixel. Together
+with layout rounding, this is what makes the $1{:}1$ view really one to one.
+
+The application is per-monitor DPI aware, so the factor can change while the window is open, when
+it is dragged to another monitor. [[OnDpiChanged]] resizes the surface then, where SwiftUI would
+update [[displayScale]].
+
+<<Win ImageCanvas: image pixels and DIPs>>=
+protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+{
+    base.OnDpiChanged(oldDpi, newDpi);
+    UpdateSize();
+}
+
+private Size DisplaySize
+{
+    get
+    {
+        double scale = _session.UseDevicePixels ? VisualTreeHelper.GetDpi(this).DpiScaleX : 1;
+        return new Size(_variant.Buffer.Width / scale, _variant.Buffer.Height / scale);
+    }
+}
+
+public void UpdateSize()
+{
+    var size = DisplaySize;
+    _surface.Width = size.Width;
+    _surface.Height = size.Height;
+}
+@ The three handlers rebuild [[DragGesture(minimumDistance: 2)]] together with the tap gesture.
+Pressing the button captures the mouse, so the drag goes on even when the pointer leaves the
+image, and focuses the variant (the tap). Moving decides the mode once the pointer has traveled
+two DIPs from the press point, and from then on writes a new line into the session, which
+redraws every overlay and chart through [[Changed]]. The hit test uses the \emph{press} point, as
+the Swift gesture uses [[startLocation]], so the mode depends on where the drag began, not on
+where it was recognized.
+
+<<Win ImageCanvas: the mouse handlers>>=
+private void OnDown(object sender, MouseButtonEventArgs e)
+{
+    _pressPoint = e.GetPosition(_surface);
+    _dragMode = null;
+    _surface.CaptureMouse();
+    _session.FocusedVariantId = _variant.Id;
+    e.Handled = true;
+}
+
+private void OnMove(object sender, MouseEventArgs e)
+{
+    if (_pressPoint is not Point start || e.LeftButton != MouseButtonState.Pressed) return;
+    var p = e.GetPosition(_surface);
+    if (_dragMode is null)
+    {
+        if ((p - start).Length < 2) return;
+        _dragMode = HitTest(start);
+        _dragInitial = _session.Line;
+    }
+    _session.Line = UpdatedLine(_dragMode.Value, start, p);
+}
+
+private void OnUp(object sender, MouseButtonEventArgs e)
+{
+    _pressPoint = null;
+    _dragMode = null;
+    _surface.ReleaseMouseCapture();
+}
+@ The hit test is the Swift one: endpoints within 9 DIPs first, then the segment within 6, and a
+new line otherwise. Measuring in DIPs keeps the targets the same size on the screen at any image
+scale. WPF's [[Point]] and [[Vector]] have the arithmetic the Swift code wrote by hand, so the
+distances are just [[(p - a).Length]].
+
+<<Win ImageCanvas: hit testing the line>>=
+private DragMode HitTest(Point p)
+{
+    var size = DisplaySize;
+    var a = ToPoint(_session.Line.Start, size);
+    var b = ToPoint(_session.Line.End, size);
+    if ((p - a).Length <= 9) return DragMode.Start;
+    if ((p - b).Length <= 9) return DragMode.End;
+    if (DistanceToSegment(p, a, b) <= 6) return DragMode.Whole;
+    return DragMode.Draw;
+}
+@ Updating the line follows the Swift chunk case by case. [[LineSegment]] is an immutable record
+here, so a changed endpoint is made with [[with]] instead of assigning to a [[var]] copy. The
+Shift key is read at every move from [[Keyboard.Modifiers]], the counterpart of
+[[NSEvent.modifierFlags]]; pressing or releasing it in the middle of a drag takes effect at once.
+
+<<Win ImageCanvas: updating the line during a drag>>=
+private LineSegment UpdatedLine(DragMode mode, Point start, Point location)
+{
+    var size = DisplaySize;
+    bool shift = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
+    var current = Normalized(location, size);
+    var line = _dragInitial;
+    switch (mode)
+    {
+        case DragMode.Start:
+            line = line with { Start = Snapped(current, line.End, size, shift) };
+            break;
+        case DragMode.End:
+            line = line with { End = Snapped(current, line.Start, size, shift) };
+            break;
+        case DragMode.Draw:
+            var s = Normalized(start, size);
+            line = new LineSegment(s, Snapped(current, s, size, shift));
+            break;
+        case DragMode.Whole:
+            <<Win ImageCanvas: moving the whole segment without leaving the image>>
+    }
+    return line;
+}
+@ Moving the whole segment clamps the offset, not the endpoints, with the bounds derived in
+Chapter~\ref{ch:views}. The translation is the pointer's distance from the press point.
+
+<<Win ImageCanvas: moving the whole segment without leaving the image>>=
+// Move both endpoints, limiting the offset so neither leaves the image.
+var i = _dragInitial;
+double dx = (location.X - start.X) / size.Width;
+double dy = (location.Y - start.Y) / size.Height;
+dx = Math.Min(Math.Max(dx, -Math.Min(i.Start.X, i.End.X)), 1 - Math.Max(i.Start.X, i.End.X));
+dy = Math.Min(Math.Max(dy, -Math.Min(i.Start.Y, i.End.Y)), 1 - Math.Max(i.Start.Y, i.End.Y));
+line = new LineSegment(new NormalizedPoint(i.Start.X + dx, i.Start.Y + dy),
+    new NormalizedPoint(i.End.X + dx, i.End.Y + dy));
+break;
+@ Shift snapping compares the displacements in displayed pixels, for the reason given in
+Chapter~\ref{ch:views}: in a wide image equal normalized steps are unequal on the screen.
+
+<<Win ImageCanvas: Shift snapping>>=
+/// <summary>With Shift held, constrains the segment to horizontal or vertical (in pixel space).</summary>
+private static NormalizedPoint Snapped(NormalizedPoint p, NormalizedPoint anchor, Size size, bool enabled)
+{
+    if (!enabled) return p;
+    double dx = Math.Abs(p.X - anchor.X) * size.Width;
+    double dy = Math.Abs(p.Y - anchor.Y) * size.Height;
+    return dx >= dy ? new NormalizedPoint(p.X, anchor.Y) : new NormalizedPoint(anchor.X, p.Y);
+}
+@ The conversions and the distance to a segment are the Swift ones, with [[Math.Clamp]] for the
+clamped projection parameter $t$.
+
+<<Win ImageCanvas: coordinate conversions>>=
+private static NormalizedPoint Normalized(Point p, Size size) =>
+    new NormalizedPoint(p.X / size.Width, p.Y / size.Height).Clamped();
+
+private static Point ToPoint(NormalizedPoint n, Size size) => new(n.X * size.Width, n.Y * size.Height);
+
+private static double DistanceToSegment(Point p, Point a, Point b)
+{
+    var ab = b - a;
+    double len2 = ab.LengthSquared;
+    if (len2 <= 0) return (p - a).Length;
+    double t = Math.Clamp(((p.X - a.X) * ab.X + (p.Y - a.Y) * ab.Y) / len2, 0, 1);
+    return (p - (a + ab * t)).Length;
+}
+@ The overlay replaces the SwiftUI [[Canvas]] with a [[FrameworkElement]] that draws in
+[[OnRender]]. It fills the surface, so again normalized coordinates become DIPs by one
+multiplication. The pens and brushes are those of the Swift overlay, with the opacities written as
+alpha bytes ($0.7 \approx 179/255$, $0.35 \approx 89/255$). They are created once and
+\emph{frozen}: a frozen [[Freezable]] can't change, so WPF needn't watch it for changes, which
+makes it cheaper to render. Setting [[Line]] invalidates only this element, which is how a drag
+redraws the line without redrawing the image under it.
+
+<<Win ImageCanvas.cs: the line overlay>>=
+/// <summary>Draws the selection line: a filled handle at the start (position 0) and a hollow one at the end.</summary>
+internal sealed class LineOverlay : FrameworkElement
+{
+    private static readonly Pen Shadow = Frozen(new Pen(new SolidColorBrush(Color.FromArgb(179, 0, 0, 0)), 3));
+    private static readonly Pen Yellow = Frozen(new Pen(Brushes.Yellow, 1.25));
+    private static readonly Pen DotOutline = Frozen(new Pen(new SolidColorBrush(Color.FromArgb(179, 0, 0, 0)), 1));
+    private static readonly Pen EndOutline = Frozen(new Pen(Brushes.Yellow, 1.5));
+    private static readonly Brush EndFill = Frozen(new SolidColorBrush(Color.FromArgb(89, 0, 0, 0)));
+
+    private LineSegment _line = LineSegment.Initial;
+
+    public LineSegment Line
+    {
+        get => _line;
+        set { _line = value; InvalidateVisual(); }
+    }
+
+    protected override void OnRender(DrawingContext dc)
+    {
+        double w = ActualWidth, h = ActualHeight;
+        var a = new Point(_line.Start.X * w, _line.Start.Y * h);
+        var b = new Point(_line.End.X * w, _line.End.Y * h);
+        dc.DrawLine(Shadow, a, b);
+        dc.DrawLine(Yellow, a, b);
+        const double r = 5;
+        dc.DrawEllipse(Brushes.Yellow, DotOutline, a, r, r);
+        dc.DrawEllipse(EndFill, EndOutline, b, r, r);
+    }
+
+    private static T Frozen<T>(T f) where T : Freezable { f.Freeze(); return f; }
+}
+@ \section{Charts}\label{sec:win-views-charts}
+
+WPF has no counterpart of Swift Charts, and a charting package would be a large dependency for
+two line plots. So the port has its own minimal chart: one abstract [[ChartView]] that draws a
+single series with its grid, axes, titles and an optional vertical rule, and two subclasses that
+only say \emph{what} to draw. The division is the one Swift Charts imposes: the Swift
+[[ProfileChart]] and [[SpectrumChart]] declare marks and scales, and the framework draws them.
+
+<<Windows/LineScope.App/Views/Charts.cs>>=
+using System.Globalization;
+using System.Windows;
+using System.Windows.Media;
+using LineScope.App.Model;
+using LineScope.Core;
+
+namespace LineScope.App.Views;
+
+<<Win Charts.cs: what a chart draws>>
+
+<<Win Charts.cs: the chart base class>>
+
+<<Win Charts.cs: the profile chart>>
+
+<<Win Charts.cs: the spectrum chart>>
+@ A [[ChartData]] gathers what the Swift modifiers set one by one: the points (as two arrays
+rather than an array of structs), the fixed domains of [[.chartXScale]] and [[.chartYScale]], the
+two axis labels, the stroke, and the [[RuleMark]] with its annotation.
+
+<<Win Charts.cs: what a chart draws>>=
+/// <summary>What a <see cref="ChartView"/> draws: one line series, its axes and an optional vertical rule.</summary>
+public sealed record ChartData(
+    double[] X, double[] Y,
+    double XMin, double XMax, double YMin, double YMax,
+    string XLabel, string YLabel,
+    Brush Stroke,
+    double? RuleX = null, string? RuleLabel = null);
+@ The data is requested in [[OnRender]], so it is computed only when WPF actually draws, and at
+most once per frame however many changes arrived before it. [[InvalidateVisual]], called by the
+pane (Section~\ref{sec:win-views-panes}), is all it takes to redraw.
+
+<<Win Charts.cs: the chart base class>>=
+/// <summary>A minimal line chart (the counterpart of Swift Charts' LinePlot) drawn directly with WPF.</summary>
+public abstract class ChartView : FrameworkElement
+{
+    private const double Pad = 10;
+
+    protected abstract ChartData? GetData();
+
+    protected override void OnRender(DrawingContext dc)
+    {
+        <<Win ChartView: data, pens and text>>
+
+        <<Win ChartView: laying out the plot area>>
+
+        <<Win ChartView: grid, ticks and axes>>
+
+        <<Win ChartView: axis titles>>
+
+        dc.PushClip(new RectangleGeometry(new Rect(plot.Left, plot.Top - 1, plot.Width, plot.Height + 2)));
+
+        <<Win ChartView: the Nyquist rule>>
+
+        <<Win ChartView: the series as one polyline>>
+        dc.Pop();
+    }
+
+    <<Win ChartView: nice tick values>>
+
+    <<Win ChartView: tick labels>>
+}
+@ The transparent rectangle makes the whole element hit-testable, so tooltips and context menus of
+the pane work over an empty chart too. Nothing is drawn when there is no data or no room.
+Text is measured with [[FormattedText]], which needs the monitor's pixels per DIP to place glyphs
+on device pixels. A degenerate range would divide by zero below, hence the last check (written
+with [[!(x > 0)]] so that it also catches NaN).
+
+<<Win ChartView: data, pens and text>>=
+dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, ActualWidth, ActualHeight));
+var data = GetData();
+if (data is null || ActualWidth < 60 || ActualHeight < 50) return;
+
+double dip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+var textBrush = SystemColors.ControlTextBrush;
+var secondary = SystemColors.GrayTextBrush;
+var gridPen = new Pen(new SolidColorBrush(Color.FromArgb(40, 128, 128, 128)), 1);
+var axisPen = new Pen(new SolidColorBrush(Color.FromArgb(110, 128, 128, 128)), 1);
+
+FormattedText Text(string s, Brush brush, double size = 10.5) =>
+    new(s, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface("Segoe UI"), size, brush, dip);
+
+double yRange = data.YMax - data.YMin, xRange = data.XMax - data.XMin;
+if (!(yRange > 0) || !(xRange > 0)) return;
+@ The plot area is what remains after the axis decorations. The left margin depends on the widest
+$y$ tick label ($-100$ is wider than $0.5$), so the $y$ ticks are computed first, about one per
+28 DIPs of height, from an estimate of the plot's height. The bottom margin holds the $x$ tick
+labels and the $x$ title. [[Px]] and [[Py]] map data to DIPs, with $y$ growing upward.
+
+<<Win ChartView: laying out the plot area>>=
+// Y tick labels decide the left margin.
+double approxPlotH = ActualHeight - 2 * Pad - 34;
+var yTicks = Ticks(data.YMin, data.YMax, Math.Max(2, (int)(approxPlotH / 28)));
+var yLabels = yTicks.Select(v => Text(TickLabel(v, yTicks), secondary)).ToList();
+double yLabelWidth = yLabels.Count > 0 ? yLabels.Max(t => t.Width) : 0;
+var yTitle = Text(data.YLabel, secondary, 11);
+
+double left = Pad + yTitle.Height + 4 + yLabelWidth + 5;
+double right = ActualWidth - Pad - 4;
+double top = Pad;
+var xTitle = Text(data.XLabel, secondary, 11);
+double bottom = ActualHeight - Pad - xTitle.Height - 4 - 14;
+if (right - left < 20 || bottom - top < 20) return;
+var plot = new Rect(left, top, right - left, bottom - top);
+
+double Px(double x) => plot.Left + (x - data.XMin) / xRange * plot.Width;
+double Py(double y) => plot.Bottom - (y - data.YMin) / yRange * plot.Height;
+@ Grid lines are drawn at every tick, faintly, as Swift Charts does by default. The $x$ ticks are
+spaced about 70 DIPs apart, and their labels are kept inside the element at the edges.
+
+<<Win ChartView: grid, ticks and axes>>=
+// Grid and ticks.
+for (int i = 0; i < yTicks.Length; i++)
+{
+    double y = Py(yTicks[i]);
+    dc.DrawLine(gridPen, new Point(plot.Left, y), new Point(plot.Right, y));
+    var t = yLabels[i];
+    dc.DrawText(t, new Point(plot.Left - 5 - t.Width, y - t.Height / 2));
+}
+var xTicks = Ticks(data.XMin, data.XMax, Math.Max(2, (int)(plot.Width / 70)));
+foreach (double v in xTicks)
+{
+    double x = Px(v);
+    dc.DrawLine(gridPen, new Point(x, plot.Top), new Point(x, plot.Bottom));
+    dc.DrawLine(axisPen, new Point(x, plot.Bottom), new Point(x, plot.Bottom + 3));
+    var t = Text(TickLabel(v, xTicks), secondary);
+    double tx = Math.Clamp(x - t.Width / 2, 0, ActualWidth - t.Width);
+    dc.DrawText(t, new Point(tx, plot.Bottom + 3));
+}
+dc.DrawLine(axisPen, new Point(plot.Left, plot.Bottom), new Point(plot.Right, plot.Bottom));
+dc.DrawLine(axisPen, new Point(plot.Left, plot.Top), new Point(plot.Left, plot.Bottom));
+@ The $y$ title is rotated a quarter turn counterclockwise about a point at the left margin, level
+with the plot's middle. Drawing it centered on that point before the rotation centers it
+vertically after it.
+
+<<Win ChartView: axis titles>>=
+// Axis titles.
+dc.DrawText(xTitle, new Point(plot.Left + (plot.Width - xTitle.Width) / 2, plot.Bottom + 18));
+dc.PushTransform(new RotateTransform(-90, Pad, plot.Top + plot.Height / 2));
+dc.DrawText(yTitle, new Point(Pad - yTitle.Width / 2, plot.Top + plot.Height / 2));
+dc.Pop();
+@ The rule and the series are clipped to the plot area (with one DIP to spare so that a curve lying
+on the axis is not cut in half). The rule is the dashed [[RuleMark]] of Chapter~\ref{ch:views},
+with the same $4,3$ dash pattern and its label to the left of the line at the top.
+
+<<Win ChartView: the Nyquist rule>>=
+// Rule (Nyquist).
+if (data.RuleX is double rx)
+{
+    var rulePen = new Pen(secondary, 1) { DashStyle = new DashStyle([4, 3], 0) };
+    double x = Px(rx);
+    dc.DrawLine(rulePen, new Point(x, plot.Top), new Point(x, plot.Bottom));
+    if (data.RuleLabel is { } label)
+    {
+        var t = Text(label, secondary, 10);
+        dc.DrawText(t, new Point(x - t.Width - 3, plot.Top + 1));
+    }
+}
+@ The series must be fast enough to follow a drag with thousands of samples, which was the reason
+for [[LinePlot]] in Swift. Drawing one [[DrawLine]] per segment would create thousands of drawing
+objects. Instead, the whole curve is a single [[StreamGeometry]], the lightest geometry WPF has,
+built with one [[PolyLineTo]] and frozen, then stroked once with round joins.
+
+<<Win ChartView: the series as one polyline>>=
+// Series.
+int n = Math.Min(data.X.Length, data.Y.Length);
+if (n >= 2)
+{
+    var geometry = new StreamGeometry();
+    using (var ctx = geometry.Open())
+    {
+        ctx.BeginFigure(new Point(Px(data.X[0]), Py(data.Y[0])), false, false);
+        var points = new List<Point>(n - 1);
+        for (int i = 1; i < n; i++) points.Add(new Point(Px(data.X[i]), Py(data.Y[i])));
+        ctx.PolyLineTo(points, true, true);
+    }
+    geometry.Freeze();
+    dc.DrawGeometry(null, new Pen(data.Stroke, 1.2) { LineJoin = PenLineJoin.Round }, geometry);
+}
+@ Swift Charts chooses ``nice'' tick values by itself; here it is done by the classic rule. Divide
+the range by the wanted number of ticks, write the rough step as $r \cdot 10^n$ with
+$1 \le r < 10$, and round $r$ up to 1, 2, 5 or 10. The ticks are then the multiples of the step
+inside the range. The small tolerances keep the last tick despite rounding errors and turn a
+value like $10^{-17}$ into an honest zero.
+
+<<Win ChartView: nice tick values>>=
+/// <summary>"Nice" tick values (steps of 1, 2 or 5 × 10ⁿ) covering [min, max].</summary>
+internal static double[] Ticks(double min, double max, int maxCount)
+{
+    double range = max - min;
+    if (!(range > 0)) return [min];
+    double rough = range / Math.Max(maxCount, 1);
+    double mag = Math.Pow(10, Math.Floor(Math.Log10(rough)));
+    double residual = rough / mag;
+    double step = (residual <= 1 ? 1 : residual <= 2 ? 2 : residual <= 5 ? 5 : 10) * mag;
+    var ticks = new List<double>();
+    for (double v = Math.Ceiling(min / step) * step; v <= max + step * 1e-9; v += step)
+        ticks.Add(Math.Abs(v) < step * 1e-9 ? 0 : v);
+    return [.. ticks];
+}
+@ A label has as many decimals as the step needs: none for a step of 20, one for $0.2$, two for
+$0.05$.
+
+<<Win ChartView: tick labels>>=
+private static string TickLabel(double v, double[] ticks)
+{
+    double step = ticks.Length > 1 ? ticks[1] - ticks[0] : Math.Abs(v);
+    int decimals = step > 0 ? Math.Clamp(-(int)Math.Floor(Math.Log10(step) + 1e-9), 0, 6) : 0;
+    return Fmt.Number(v, decimals);
+}
+@ The profile chart is the Swift one: $x$ from 0 to 1 along the line, $y$ fixed to the channel's
+natural range, so charts of different variants can be compared by eye.
+
+<<Win Charts.cs: the profile chart>>=
+/// <summary>Zone 2: the selected channel sampled along the line in this variant's own pixel grid.</summary>
+public sealed class ProfileChart(Session session, ImageVariant variant) : ChartView
+{
+    public ImageVariant Variant { get; set; } = variant;
+
+    protected override ChartData GetData()
+    {
+        var profile = session.Profile(Variant);
+        var (min, max) = session.ColorModel.RangeOfChannel(session.ChannelIndex);
+        return new ChartData(
+            profile.X, profile.Values.Select(v => (double)v).ToArray(), 0, 1, min, max,
+            $"Position along line ({profile.Samples.Colors.Length} samples)", session.ChannelName, ChannelBrush());
+    }
+
+    <<Win ProfileChart: a color for each channel>>
+}
+@ The channel colors are the RGB values of the macOS system colors that the Swift chart names
+([[.red]], [[.green]], [[.blue]], [[.cyan]], [[.pink]], [[.yellow]], [[.purple]], [[.orange]]), so
+both versions color a channel alike. Channels without a natural hue use the text color.
+
+<<Win ProfileChart: a color for each channel>>=
+private Brush ChannelBrush() => (session.ColorModel, session.ChannelIndex) switch
+{
+    (ColorModel.Rgba, 0) => Rgb(0xFF, 0x3B, 0x30),
+    (ColorModel.Rgba, 1) => Rgb(0x28, 0xCD, 0x41),
+    (ColorModel.Rgba, 2) => Rgb(0x00, 0x7A, 0xFF),
+    (ColorModel.Cmyk, 0) => Rgb(0x00, 0xC0, 0xE8),
+    (ColorModel.Cmyk, 1) => Rgb(0xFF, 0x2D, 0x55),
+    (ColorModel.Cmyk, 2) => Rgb(0xFF, 0xCC, 0x00),
+    (ColorModel.Hsl, 0) => Rgb(0xAF, 0x52, 0xDE),
+    (ColorModel.Hsl, 1) => Rgb(0xFF, 0x95, 0x00),
+    _ => SystemColors.ControlTextBrush,
+};
+
+private static SolidColorBrush Rgb(byte r, byte g, byte b)
+{
+    var brush = new SolidColorBrush(Color.FromRgb(r, g, b));
+    brush.Freeze();
+    return brush;
+}
+@ The spectrum chart gathers in one method what the Swift version spreads over its helpers. The
+$x$ axis ends at the Nyquist frequency, the frequency of the last bin in the current unit, and the
+rule marks it (why this matters is explained in Chapter~\ref{ch:views}). In decibels the $y$
+range runs from the session's floor of $-100$\,dB up to the next multiple of 10\,dB above the
+peak, and at least to 0\,dB; on the linear scale it runs from 0 to the peak plus 5\,\% headroom.
+Both ranges are fixed by rules rather than fitted to the data, so the spectra of different
+variants mostly share one scale. An empty spectrum ([[FftSize]] of 0, a line too short to sample)
+draws nothing. As in Swift, the $x$ label gives the FFT size.
+
+<<Win Charts.cs: the spectrum chart>>=
+/// <summary>Zone 3: amplitude spectrum of the zone-2 profile.</summary>
+public sealed class SpectrumChart(Session session, ImageVariant variant) : ChartView
+{
+    public ImageVariant Variant { get; set; } = variant;
+
+    protected override ChartData? GetData()
+    {
+        var profile = session.Profile(Variant);
+        var spectrum = session.Spectrum(profile);
+        if (spectrum.FftSize == 0) return null;
+        var (freqs, mags) = session.SpectrumPoints(spectrum);
+        double nyquist = freqs[^1];
+        double top = mags.Length > 0 ? mags.Max() : 1;
+        var (yMin, yMax) = session.LogMagnitude
+            ? (Session.DbFloor, Math.Max(0, Math.Ceiling(top / 10) * 10))
+            : (0.0, Math.Max(top * 1.05, 1e-6));
+        return new ChartData(
+            freqs, mags, 0, Math.Max(nyquist, 1e-9), yMin, yMax,
+            $"Frequency ({session.FrequencyAxis.DisplayName()}), FFT size {spectrum.FftSize}",
+            session.LogMagnitude ? "Amplitude (dB)" : "Amplitude",
+            SystemColors.HighlightBrush, nyquist, "Nyquist");
+    }
+}
+@ \section{The parameter dialog}\label{sec:win-views-parameters}
+
+The sheet of Section~\ref{sec:parameter-sheet} becomes a modal dialog. Its contract is narrower:
+it doesn't run anything, it only builds an [[Operation]], and the main window runs it
+(Section~\ref{sec:win-views-menus}). The parameters, defaults, ranges and limits are the Swift ones.
+
+<<Windows/LineScope.App/Views/ParameterDialog.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Media;
+using LineScope.App.Model;
+using LineScope.Core;
+
+namespace LineScope.App.Views;
+
+/// <summary>Collects parameters for a filter or resample; the caller runs <see cref="Operation"/> on the focused variant.</summary>
+public sealed class ParameterDialog : Window
+{
+    <<Win ParameterDialog: parameters and their defaults>>
+
+    <<Win ParameterDialog: layout>>
+
+    <<Win ParameterDialog: fields for each request>>
+
+    <<Win ParameterDialog: a numeric field>>
+
+    <<Win ParameterDialog: a labeled row>>
+
+    <<Win ParameterDialog: validating a resample>>
+
+    <<Win ParameterDialog: building the operation>>
+}
+@ The source variant is captured when the dialog opens. It cannot change while the dialog is
+modal, and the Swift sheet names the same variant.
+
+<<Win ParameterDialog: parameters and their defaults>>=
+private const int MaxOutputSide = 16_384;
+
+private readonly OperationRequest _request;
+private readonly ImageVariant _source;
+private readonly Button _apply;
+private TextBlock? _result;
+
+private double _radius = 2.0;
+private double _intensity = 0.5;
+private double _noiseLevel = 0.02;
+private double _sharpness = 0.4;
+private double _scale = 0.5;
+
+public ImageOperation? Operation { get; private set; }
+@ The layout is the sheet's: title, the variant it applies to, the fields, and Cancel and Apply.
+[[IsCancel]] and [[IsDefault]] give Escape and Enter their usual meaning, like the Swift keyboard
+shortcuts. Setting [[DialogResult]] closes the dialog and makes [[ShowDialog]] return [[true]].
+
+<<Win ParameterDialog: layout>>=
+public ParameterDialog(OperationRequest request, Session session)
+{
+    _request = request;
+    _source = session.FocusedVariant;
+    Title = request.Title;
+    SizeToContent = SizeToContent.Height;
+    Width = 420;
+    ResizeMode = ResizeMode.NoResize;
+    WindowStartupLocation = WindowStartupLocation.CenterOwner;
+    ShowInTaskbar = false;
+    UseLayoutRounding = true;
+
+    var fields = new Grid { Margin = new Thickness(0, 10, 0, 16) };
+    fields.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+    fields.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+    BuildFields(fields);
+
+    var cancel = new Button { Content = "Cancel", IsCancel = true, MinWidth = 80, Margin = new Thickness(0, 0, 8, 0) };
+    _apply = new Button { Content = "Apply", IsDefault = true, MinWidth = 80 };
+    _apply.Click += (_, _) =>
+    {
+        Operation = BuildOperation();
+        DialogResult = true;
+    };
+
+    Content = new StackPanel
+    {
+        Margin = new Thickness(20),
+        Children =
+        {
+            new TextBlock { Text = request.Title, FontWeight = FontWeights.SemiBold, FontSize = 14 },
+            new TextBlock
+            {
+                Text = $"Applies to: {_source.Name} ({_source.Buffer.Width}×{_source.Buffer.Height})",
+                FontSize = 11, Foreground = Ui.SecondaryText, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0),
+            },
+            fields,
+            new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Children = { cancel, _apply } },
+        },
+    };
+    Validate();
+}
+@ Each request shows its own fields, as in Swift.
+
+<<Win ParameterDialog: fields for each request>>=
+private void BuildFields(Grid grid)
+{
+    switch (_request)
+    {
+        case OperationRequest.GaussianBlur or OperationRequest.BoxBlur:
+            Number(grid, "Radius (px)", _radius, 0, 100, v => _radius = v);
+            break;
+        case OperationRequest.UnsharpMask:
+            Number(grid, "Radius (px)", _radius, 0, 100, v => _radius = v);
+            Number(grid, "Intensity", _intensity, 0, 10, v => _intensity = v);
+            break;
+        case OperationRequest.NoiseReduction:
+            Number(grid, "Noise level", _noiseLevel, 0, 0.1, v => _noiseLevel = v);
+            Number(grid, "Sharpness", _sharpness, 0, 2, v => _sharpness = v);
+            break;
+        case OperationRequest.Resample:
+            <<Win ParameterDialog: the scale field and the resulting size>>
+    }
+}
+@ The scale is a text field with a presets button, and below it the size the resample will
+produce. Text that doesn't parse, or a scale that isn't positive, is marked with a red border and
+turns the scale into NaN, which [[Validate]] rejects. The result uses tabular figures, so the
+numbers don't shift sideways as they are typed.
+
+<<Win ParameterDialog: the scale field and the resulting size>>=
+var box = new TextBox { Text = Fmt.Number(_scale, 4), Width = 80, VerticalContentAlignment = VerticalAlignment.Center };
+box.TextChanged += (_, _) =>
+{
+    bool ok = Ui.TryParse(box.Text, out double v) && v > 0;
+    if (ok) _scale = v; else _scale = double.NaN;
+    box.BorderBrush = ok ? SystemColors.ControlDarkBrush : Brushes.Red;
+    Validate();
+};
+var presets = Ui.PresetsButton(new[] { 0.25, 0.5, 0.75, 1.5, 2, 4 }
+    .Select(s => ($"×{Fmt.Number(s)}", (Action)(() => box.Text = Fmt.Number(s, 4)))));
+AddRow(grid, "Scale factor", new StackPanel { Orientation = Orientation.Horizontal, Children = { box, presets } });
+_result = new TextBlock { VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI") };
+Typography.SetNumeralAlignment(_result, FontNumeralAlignment.Tabular);
+AddRow(grid, "Result", _result);
+break;
+@ WPF has no drop-down button, so [[Ui.PresetsButton]] opens a context menu below an ordinary
+button. The parameter dialog uses it for scales, the pattern window for sizes.
+
+<<Win Ui: a presets button>>=
+/// <summary>A button that opens a drop-down menu of presets.</summary>
+public static Button PresetsButton(IEnumerable<(string Label, Action Action)> items)
+{
+    var menu = new ContextMenu();
+    foreach (var (label, action) in items)
+    {
+        var mi = new MenuItem { Header = label };
+        mi.Click += (_, _) => action();
+        menu.Items.Add(mi);
+    }
+    var button = new Button { Content = "Presets ▾", Padding = new Thickness(8, 1, 8, 1), Margin = new Thickness(6, 0, 0, 0) };
+    button.Click += (_, _) =>
+    {
+        menu.PlacementTarget = button;
+        menu.Placement = PlacementMode.Bottom;
+        menu.IsOpen = true;
+    };
+    return button;
+}
+@ A numeric parameter is a slider next to a text field, as in the sheet. SwiftUI binds both to one
+[[@State]]; here each control updates the other, and the [[syncing]] flag stops the echo (the
+slider moving the text, which moves the slider again). The slider shows the value clamped to its
+range, but a typed value outside the range is kept, as in Swift.
+
+<<Win ParameterDialog: a numeric field>>=
+private void Number(Grid grid, string label, double initial, double min, double max, Action<double> set)
+{
+    var slider = new Slider { Minimum = min, Maximum = max, Value = initial, VerticalAlignment = VerticalAlignment.Center };
+    var box = new TextBox { Text = Fmt.Number(initial), Width = 64, Margin = new Thickness(8, 0, 0, 0), VerticalContentAlignment = VerticalAlignment.Center };
+    bool syncing = false;
+    slider.ValueChanged += (_, e) =>
+    {
+        if (syncing) return;
+        syncing = true;
+        set(e.NewValue);
+        box.Text = Fmt.Number(e.NewValue);
+        syncing = false;
+    };
+    box.TextChanged += (_, _) =>
+    {
+        if (syncing) return;
+        bool ok = Ui.TryParse(box.Text, out double v) && v >= 0;
+        box.BorderBrush = ok ? SystemColors.ControlDarkBrush : Brushes.Red;
+        if (!ok) return;
+        syncing = true;
+        set(v);
+        slider.Value = Math.Clamp(v, min, max);
+        syncing = false;
+    };
+    var cell = new DockPanel();
+    DockPanel.SetDock(box, Dock.Right);
+    cell.Children.Add(box);
+    cell.Children.Add(slider);
+    AddRow(grid, label, cell);
+}
+@ Numbers are shown in the user's locale, which in much of the world writes $0{,}5$. But many
+users type a period anyway, especially people used to programming. A plain locale parser would
+read ``0.5'' as 5 in German, since the period is its thousands separator. So [[Ui.TryParse]] first
+tries the current culture and then the invariant one, and it accepts thousands separators only in
+the first attempt. The result is that ``0,5'' and ``0.5'' both mean one half under a comma locale,
+while under an English locale the second attempt changes nothing.
+
+<<Win Ui: parsing a number in either notation>>=
+public static bool TryParse(string text, out double value) =>
+    double.TryParse(text, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out value)
+    || double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+@ Rows are laid out in a two-column grid, labels on the left, the SwiftUI [[LabeledContent]] of
+the sheet.
+
+<<Win ParameterDialog: a labeled row>>=
+private static void AddRow(Grid grid, string label, UIElement content)
+{
+    int row = grid.RowDefinitions.Count;
+    grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+    var text = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 5, 14, 5) };
+    Grid.SetRow(text, row);
+    grid.Children.Add(text);
+    if (content is FrameworkElement fe) fe.Margin = new Thickness(0, 5, 0, 5);
+    Grid.SetRow(content, row);
+    Grid.SetColumn(content, 1);
+    grid.Children.Add(content);
+}
+@ The validation is the Swift one, with a guard that C\# needs and Swift did not. Converting a
+double that exceeds the [[int]] range to [[int]] doesn't trap in C\#; it silently produces a
+meaningless value, which could pass the size check. So the size is first checked in floating
+point, and only a plausible one is computed with [[Resampler.OutputSize]].
+
+<<Win ParameterDialog: validating a resample>>=
+private void Validate()
+{
+    if (_request is not OperationRequest.Resample)
+    {
+        _apply.IsEnabled = true;
+        return;
+    }
+    // Check in floating point first: casting a huge size to int would overflow.
+    double largest = Math.Max(_source.Buffer.Width, _source.Buffer.Height) * _scale;
+    bool valid = _scale > 0 && largest < 1e9;
+    if (valid)
+    {
+        int w = Resampler.OutputSize(_source.Buffer.Width, _scale);
+        int h = Resampler.OutputSize(_source.Buffer.Height, _scale);
+        valid = Math.Max(w, h) <= MaxOutputSide;
+        if (_result is not null) _result.Text = $"{w} × {h} px";
+    }
+    else if (_result is not null)
+    {
+        _result.Text = "—";
+    }
+    _apply.IsEnabled = valid;
+}
+@ The operation is built with a [[switch]] expression over the request's record type.
+
+<<Win ParameterDialog: building the operation>>=
+private ImageOperation BuildOperation() => _request switch
+{
+    OperationRequest.GaussianBlur => new ImageOperation.Filter(new FilterKind.GaussianBlur(_radius)),
+    OperationRequest.BoxBlur => new ImageOperation.Filter(new FilterKind.BoxBlur(_radius)),
+    OperationRequest.UnsharpMask => new ImageOperation.Filter(new FilterKind.UnsharpMask(_radius, _intensity)),
+    OperationRequest.NoiseReduction => new ImageOperation.Filter(new FilterKind.NoiseReduction(_noiseLevel, _sharpness)),
+    OperationRequest.Resample r => new ImageOperation.Resample(r.Method, _scale),
+    _ => throw new InvalidOperationException(),
+};
+@ \section{The test-pattern window}\label{sec:win-views-patterns}
+
+[[TestPatternWindow]] is the generator window of Chapter~\ref{ch:views}. The pattern analysis
+window has no counterpart here: a pattern is opened in an ordinary [[MainWindow]], which shows its
+loading state while the pattern is generated (Chapter~\ref{ch:win-overview}). The generator keeps
+its spec in a field, and every control that edits it calls [[SpecChanged]], which is what the
+SwiftUI [[.task(id: spec)]] reacts to implicitly.
+
+<<Windows/LineScope.App/Views/TestPatternWindow.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using LineScope.App.Model;
+using LineScope.Core;
+
+namespace LineScope.App.Views;
+
+/// <summary>Window for choosing a pattern, its size and parameter before creating it.</summary>
+public sealed class TestPatternWindow : Window
+{
+    <<Win TestPatternWindow: fields>>
+
+    <<Win TestPatternWindow: building the window>>
+
+    <<Win TestPatternWindow: size fields>>
+
+    <<Win TestPatternWindow: parameter field>>
+
+    <<Win TestPatternWindow: debouncing the preview>>
+
+    <<Win TestPatternWindow: rendering the preview>>
+
+    <<Win TestPatternWindow: grid rows>>
+}
+@ The limits are the Swift ones: presets from 128 to 2048, at most 8192 pixels per side, and no
+preview above $2048\times2048$ pixels.
+
+<<Win TestPatternWindow: fields>>=
+private static readonly int[] Sizes = [128, 256, 512, 1024, 2048];
+private const int MaxSide = 8192;
+private const int MaxPreviewPixels = 2048 * 2048;
+
+private TestPatternSpec _spec = new(TestPatternKind.ZonePlate);
+private bool _sizeValid = true;
+
+private readonly ComboBox _kind;
+private readonly TextBlock _purpose;
+private readonly TextBox _width, _height;
+private readonly Grid _parameterRow = new();
+private readonly Button _create;
+private readonly Image _preview;
+private readonly TextBlock _previewCaption;
+private readonly DispatcherTimer _debounce;
+private int _previewGeneration;
+@ The window is a form on the left and the preview on the right, and sizes itself to its content.
+Create opens a window for the clamped spec; unlike SwiftUI's [[openWindow(value:)]], it opens a new
+window every time.
+
+<<Win TestPatternWindow: building the window>>=
+public TestPatternWindow()
+{
+    Title = "New Test Pattern";
+    SizeToContent = SizeToContent.WidthAndHeight;
+    ResizeMode = ResizeMode.CanMinimize;
+    UseLayoutRounding = true;
+    WindowStartupLocation = WindowStartupLocation.CenterScreen;
+
+    <<Win TestPatternWindow: pattern picker and description>>
+
+    <<Win TestPatternWindow: the size row>>
+
+    _create = new Button { Content = "Create", IsDefault = true, MinWidth = 80, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 14, 0, 0) };
+    _create.Click += (_, _) => App.Current.OpenPattern(_spec.Clamped());
+
+    var form = new Grid { Width = 380 };
+    form.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+    form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+    AddRow(form, "Pattern", _kind);
+    AddSpanning(form, _purpose);
+    AddRow(form, "Size", sizeRow);
+    AddSpanning(form, _parameterRow);
+    AddSpanning(form, _create);
+    BuildParameterRow();
+
+    <<Win TestPatternWindow: the preview box>>
+
+    Content = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(16), Children = { form, previewPanel } };
+
+    _debounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(80) };
+    _debounce.Tick += (_, _) => { _debounce.Stop(); UpdatePreview(); };
+    SpecChanged();
+}
+@ Changing the kind builds a new spec that keeps the size and takes the new kind's default
+parameter, for the reason given in Chapter~\ref{ch:views}; the parameter row is rebuilt because
+its name, range and slider depend on the kind. The [[!]] after [[_purpose]] tells the compiler
+that the field is assigned by the time the event can fire.
+
+<<Win TestPatternWindow: pattern picker and description>>=
+_kind = new ComboBox { ItemsSource = TestPatternKindInfo.All.Select(k => k.DisplayName()).ToList(), SelectedIndex = 0 };
+_kind.SelectionChanged += (_, _) =>
+{
+    // Resets the parameter to the new pattern's default when the kind changes.
+    _spec = new TestPatternSpec(TestPatternKindInfo.All[_kind.SelectedIndex], _spec.Width, _spec.Height);
+    _purpose!.Text = _spec.Kind.Purpose();
+    BuildParameterRow();
+    SpecChanged();
+};
+_purpose = new TextBlock
+{
+    Text = _spec.Kind.Purpose(), TextWrapping = TextWrapping.Wrap, FontSize = 11, Foreground = Ui.SecondaryText,
+    Margin = new Thickness(0, 6, 0, 10),
+};
+@ A size preset writes both text boxes, and their change handlers do the rest.
+
+<<Win TestPatternWindow: the size row>>=
+_width = SizeBox(_spec.Width);
+_height = SizeBox(_spec.Height);
+var presets = Ui.PresetsButton(Sizes.Select(s => ($"{s} × {s}", (Action)(() =>
+{
+    _width.Text = s.ToString();
+    _height.Text = s.ToString();
+}))));
+var sizeRow = new StackPanel
+{
+    Orientation = Orientation.Horizontal,
+    Children = { _width, new TextBlock { Text = "×", Margin = new Thickness(6, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center }, _height, presets },
+};
+@ The size boxes accept only whole numbers in range. An invalid size keeps the last valid spec but
+disables Create and the preview. The null check covers the first box's handler, which runs while
+the second box doesn't exist yet.
+
+<<Win TestPatternWindow: size fields>>=
+private TextBox SizeBox(int value)
+{
+    var box = new TextBox { Text = value.ToString(), Width = 64, VerticalContentAlignment = VerticalAlignment.Center };
+    box.TextChanged += (_, _) => ReadSize();
+    return box;
+}
+
+private void ReadSize()
+{
+    if (_width is null || _height is null) return;
+    bool okW = int.TryParse(_width.Text, out int w) && w is >= 1 and <= MaxSide;
+    bool okH = int.TryParse(_height.Text, out int h) && h is >= 1 and <= MaxSide;
+    _width.BorderBrush = okW ? SystemColors.ControlDarkBrush : Brushes.Red;
+    _height.BorderBrush = okH ? SystemColors.ControlDarkBrush : Brushes.Red;
+    _sizeValid = okW && okH;
+    if (_sizeValid) _spec = _spec with { Width = w, Height = h };
+    SpecChanged();
+}
+@ The parameter row is the numeric field of the parameter dialog, adapted to the pattern's
+parameter: its name and range come from the kind, kinds without a parameter show nothing, and the
+noise seed gets no slider. As there, the typed value is kept even outside the slider's range, and
+Create clamps it.
+
+<<Win TestPatternWindow: parameter field>>=
+private void BuildParameterRow()
+{
+    _parameterRow.Children.Clear();
+    _parameterRow.ColumnDefinitions.Clear();
+    var p = _spec.Kind.Parameter();
+    if (p is null) return;
+    _parameterRow.Margin = new Thickness(0, 10, 0, 0);
+    _parameterRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+    _parameterRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+    _parameterRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+    var label = new TextBlock { Text = p.Name, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
+    _parameterRow.Children.Add(label);
+    var box = new TextBox { Text = Fmt.Number(_spec.Parameter, 4), Width = 70, Margin = new Thickness(8, 0, 0, 0), VerticalContentAlignment = VerticalAlignment.Center };
+    Grid.SetColumn(box, 2);
+    _parameterRow.Children.Add(box);
+    bool syncing = false;
+    Slider? slider = null;
+    if (_spec.Kind != TestPatternKind.WhiteNoise)
+    {
+        slider = new Slider { Minimum = p.Min, Maximum = p.Max, Value = _spec.Parameter, VerticalAlignment = VerticalAlignment.Center };
+        slider.ValueChanged += (_, e) =>
+        {
+            if (syncing) return;
+            syncing = true;
+            _spec = _spec with { Parameter = e.NewValue };
+            box.Text = Fmt.Number(e.NewValue, 4);
+            syncing = false;
+            SpecChanged();
+        };
+        Grid.SetColumn(slider, 1);
+        _parameterRow.Children.Add(slider);
+    }
+    box.TextChanged += (_, _) =>
+    {
+        if (syncing) return;
+        bool ok = Ui.TryParse(box.Text, out double v);
+        box.BorderBrush = ok ? SystemColors.ControlDarkBrush : Brushes.Red;
+        if (!ok) return;
+        syncing = true;
+        _spec = _spec with { Parameter = v };
+        if (slider is not null) slider.Value = p.Clamp(v);
+        syncing = false;
+        SpecChanged();
+    };
+}
+@ The preview box is exactly $256\times256$ DIPs, and the image in it is not stretched, with
+nearest-neighbor scaling in case the system scales it anyway. Under the default mapping of
+Section~\ref{sec:win-views-canvas} a DIP is an image pixel, so the preview shows pixels as the
+analysis window will.
+
+<<Win TestPatternWindow: the preview box>>=
+_preview = new Image { Width = 256, Height = 256, Stretch = Stretch.None };
+RenderOptions.SetBitmapScalingMode(_preview, BitmapScalingMode.NearestNeighbor);
+_previewCaption = new TextBlock { FontSize = 11, Foreground = Ui.SecondaryText, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 6, 0, 0) };
+var previewPanel = new StackPanel
+{
+    Margin = new Thickness(20, 0, 0, 0),
+    Children =
+    {
+        new Border { Width = 256, Height = 256, Background = SystemColors.AppWorkspaceBrush, CornerRadius = new CornerRadius(4), Child = _preview, ClipToBounds = true },
+        _previewCaption,
+    },
+};
+@ SwiftUI debounces by cancelling the spec's task and sleeping 80\,ms in the new one. The port uses
+a [[DispatcherTimer]] of 80\,ms that every change restarts, so the preview is rendered only once
+the spec has been left alone that long. A generation counter replaces task cancellation: each
+change increments it, and a preview that finishes after a newer change is discarded instead of
+overwriting a more recent one.
+
+<<Win TestPatternWindow: debouncing the preview>>=
+private void SpecChanged()
+{
+    if (_create is null) return;
+    _create.IsEnabled = _sizeValid;
+    _previewGeneration++;
+    _debounce.Stop();
+    bool previewable = _sizeValid && (long)_spec.Width * _spec.Height <= MaxPreviewPixels;
+    _previewCaption.Text = previewable ? "Preview: center 256 × 256 px at 1:1" : "Too large to preview";
+    if (!previewable)
+    {
+        _preview.Source = null;
+        return;
+    }
+    _debounce.Start();
+}
+@ As in Swift, the preview is the center of the \emph{full} pattern, not a small pattern, because
+a zone plate made small is a different image. The generation runs on the thread pool. The crop is
+a [[CroppedBitmap]] of the full bitmap, frozen so that it can be handed from the worker thread to
+the user-interface thread.
+
+<<Win TestPatternWindow: rendering the preview>>=
+/// <summary>
+/// Generates the real pattern and shows its central pixels at 1:1, so aliasing looks as it will in the
+/// analysis window.
+/// </summary>
+private async void UpdatePreview()
+{
+    int generation = _previewGeneration;
+    var s = _spec.Clamped();
+    var bitmap = await Task.Run(() =>
+    {
+        var full = TestPatternGenerator.Make(s);
+        int w = Math.Min(s.Width, 256), h = Math.Min(s.Height, 256);
+        var cropped = new CroppedBitmap(Bitmaps.FromBuffer(full), new Int32Rect((s.Width - w) / 2, (s.Height - h) / 2, w, h));
+        cropped.Freeze();
+        return (BitmapSource)cropped;
+    });
+    if (generation == _previewGeneration) _preview.Source = bitmap;
+}
+@ Two small helpers add a labeled row or a row spanning both columns to the form.
+
+<<Win TestPatternWindow: grid rows>>=
+private static void AddRow(Grid grid, string label, UIElement content)
+{
+    int row = grid.RowDefinitions.Count;
+    grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+    var text = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 12, 4) };
+    Grid.SetRow(text, row);
+    grid.Children.Add(text);
+    Grid.SetRow(content, row);
+    Grid.SetColumn(content, 1);
+    grid.Children.Add(content);
+}
+
+private static void AddSpanning(Grid grid, UIElement content)
+{
+    int row = grid.RowDefinitions.Count;
+    grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+    Grid.SetRow(content, row);
+    Grid.SetColumnSpan(content, 2);
+    grid.Children.Add(content);
+}
+@ \section{The inspector}\label{sec:win-views-inspector}
+
+The inspector is still a separate window describing the focused variant of the most recently
+active document window, and it still finds that window through [[ActiveSession]]. It is now the
+only reader of [[ActiveSession]], since the menus know their own window's session. Without
+SwiftUI's observation it has to subscribe to two things by hand: the active session changing, and
+the active session's own [[Changed]] event.
+
+<<Windows/LineScope.App/Views/InspectorWindow.cs>>=
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Threading;
+using LineScope.App.Model;
+using LineScope.Core;
+
+namespace LineScope.App.Views;
+
+/// <summary>Separate window describing the focused variant of the most recently active document window.</summary>
+public sealed class InspectorWindow : Window
+{
+    private readonly ScrollViewer _scroll = new() { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(14, 4, 14, 14) };
+    private Session? _observed;
+    private bool _refreshQueued;
+
+    <<Win InspectorWindow: placing the window>>
+
+    <<Win InspectorWindow: following the active session>>
+
+    <<Win InspectorWindow: rebuilding the content>>
+
+    <<Win InspectorWindow: section and row helpers>>
+}
+@ The inspector opens as a narrow window near the top-right corner of the work area, where it
+covers the least of a document window. Closing it unsubscribes from both events; otherwise the
+static [[ActiveSession.Changed]] would keep the closed window alive and busy.
+
+<<Win InspectorWindow: placing the window>>=
+public InspectorWindow()
+{
+    Title = "Inspector";
+    Width = 340;
+    Height = Math.Min(760, SystemParameters.WorkArea.Height - 40);
+    MinWidth = 300;
+    MinHeight = 320;
+    UseLayoutRounding = true;
+    ShowInTaskbar = false;
+    var work = SystemParameters.WorkArea;
+    WindowStartupLocation = WindowStartupLocation.Manual;
+    Left = work.Right - Width - 20;
+    Top = work.Top + 20;
+    Content = _scroll;
+    Background = SystemColors.WindowBrush;
+
+    ActiveSession.Changed += OnActiveChanged;
+    Closed += (_, _) =>
+    {
+        ActiveSession.Changed -= OnActiveChanged;
+        Observe(null);
+    };
+    OnActiveChanged();
+}
+@ The inspector shows nearly everything, so it rebuilds on any change. But a line drag raises one
+change per mouse move, and rebuilding a whole panel of text boxes that often would make the drag
+stutter. So changes are coalesced: the first one queues a rebuild at [[Background]] priority,
+below input and rendering, and later ones are ignored until it has run. A drag thus updates the
+inspector at most once per pass of the dispatcher, after the canvas and charts have been drawn.
+
+<<Win InspectorWindow: following the active session>>=
+private void OnActiveChanged()
+{
+    Observe(ActiveSession.Current);
+    Rebuild();
+}
+
+private void Observe(Session? session)
+{
+    if (_observed is not null) _observed.Changed -= OnSessionChanged;
+    _observed = session;
+    if (_observed is not null) _observed.Changed += OnSessionChanged;
+}
+
+/// <summary>Coalesces bursts of changes (such as a line drag) into one rebuild.</summary>
+private void OnSessionChanged(SessionChange change)
+{
+    if (_refreshQueued) return;
+    _refreshQueued = true;
+    Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+    {
+        _refreshQueued = false;
+        Rebuild();
+    });
+}
+@ The content has the five sections of the Swift inspector, in the same order and with the same
+rows. Like the Swift version, it asks the session for the same profile and spectrum as the charts,
+so the numbers agree with the zones.
+
+<<Win InspectorWindow: rebuilding the content>>=
+private void Rebuild()
+{
+    var session = _observed;
+    if (session is null)
+    {
+        <<Win InspectorWindow: the empty state>>
+    }
+
+    var variant = session.FocusedVariant;
+    var profile = session.Profile(variant);
+    var spectrum = session.Spectrum(profile);
+    var info = session.SourceInfo;
+    var original = session.Original.Buffer;
+    var panel = new StackPanel();
+
+    <<Win InspectorWindow: the file section>>
+
+    <<Win InspectorWindow: the focused-image section>>
+
+    <<Win InspectorWindow: the operation-chain section>>
+
+    <<Win InspectorWindow: the line section>>
+
+    <<Win InspectorWindow: the channel-statistics section>>
+
+    <<Win InspectorWindow: keeping the scroll position>>
+}
+@ With no document open, the inspector says so, as the Swift [[ContentUnavailableView]] does.
+
+<<Win InspectorWindow: the empty state>>=
+_scroll.Content = new StackPanel
+{
+    VerticalAlignment = VerticalAlignment.Center,
+    Margin = new Thickness(0, 120, 0, 0),
+    Children =
+    {
+        new TextBlock { Text = "No Image", FontSize = 18, FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center },
+        new TextBlock { Text = "Open an image to inspect it.", Foreground = Ui.SecondaryText, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 6, 0, 0) },
+    },
+};
+return;
+@ The file section reports what the WIC decoder found (Chapter~\ref{ch:win-model}).
+
+<<Win InspectorWindow: the file section>>=
+Section(panel, "File");
+Row(panel, "Name", session.FileName);
+Row(panel, "Type", info.FileType);
+Row(panel, "Stored size", $"{info.PixelWidth} × {info.PixelHeight} px");
+Row(panel, "Bit depth", $"{info.BitsPerComponent} bpc, {info.BitsPerPixel} bpp");
+Row(panel, "Color space", info.ColorSpaceName);
+Row(panel, "Alpha", info.HasAlpha ? "Yes" : "No");
+if (info.Dpi is double dpi) Row(panel, "Resolution", $"{Fmt.Fixed(dpi, 0)} dpi");
+@ The focused-image, operation-chain and line sections are row for row those of
+Chapter~\ref{ch:views}: the scale per axis, the full lineage, and the line in this variant's
+pixels with its length, sample count and spacing.
+
+<<Win InspectorWindow: the focused-image section>>=
+Section(panel, "Focused Image");
+Row(panel, "Tab", variant.Name);
+Row(panel, "Size", $"{variant.Buffer.Width} × {variant.Buffer.Height} px");
+Row(panel, "Scale vs. original",
+    $"×{Fmt.Fixed((double)variant.Buffer.Width / original.Width, 4)} · ×{Fmt.Fixed((double)variant.Buffer.Height / original.Height, 4)}");
+Row(panel, "Working format", "RGBA Float32, sRGB-encoded");
+@ The chain starts with the original and numbers every step after it.
+
+<<Win InspectorWindow: the operation-chain section>>=
+Section(panel, "Operation Chain");
+panel.Children.Add(new TextBlock { Text = "Original", Foreground = Ui.SecondaryText, Margin = new Thickness(0, 2, 0, 2) });
+for (int i = 0; i < variant.Lineage.Count; i++)
+    panel.Children.Add(new TextBlock { Text = $"{i + 1}. {variant.Lineage[i].DisplayName}", Margin = new Thickness(0, 2, 0, 2), TextWrapping = TextWrapping.Wrap });
+@ The line's endpoints are converted from normalized coordinates to this variant's pixels.
+
+<<Win InspectorWindow: the line section>>=
+Section(panel, "Line");
+double w = variant.Buffer.Width, h = variant.Buffer.Height;
+var l = session.Line;
+Row(panel, "Start", $"({Fmt.Fixed(l.Start.X * w, 1)}, {Fmt.Fixed(l.Start.Y * h, 1)}) px");
+Row(panel, "End", $"({Fmt.Fixed(l.End.X * w, 1)}, {Fmt.Fixed(l.End.Y * h, 1)}) px");
+Row(panel, "Length", $"{Fmt.Fixed(profile.Samples.PixelLength, 1)} px");
+Row(panel, "Samples", $"{profile.Values.Length}, spacing {Fmt.Fixed(profile.Samples.Spacing, 3)} px");
+@ The statistics guard against an empty profile, where [[Min]] and [[Max]] of LINQ would throw
+instead of returning a value, and the peak is shown only if the spectrum has one.
+
+<<Win InspectorWindow: the channel-statistics section>>=
+Section(panel, $"{session.ColorModel.DisplayName()} · {session.ChannelName}");
+var v = profile.Values;
+Row(panel, "Min", Fmt.Fixed(v.Length > 0 ? v.Min() : 0, 4));
+Row(panel, "Max", Fmt.Fixed(v.Length > 0 ? v.Max() : 0, 4));
+Row(panel, "Mean", Fmt.Fixed(v.Sum() / Math.Max(v.Length, 1), 4));
+if (spectrum.PeakIndex is int k)
+{
+    Row(panel, "Peak frequency", $"{Fmt.Fixed(spectrum.CyclesPerPixel[k], 4)} c/px · {Fmt.Fixed(spectrum.CyclesPerLine[k], 2)} c/line");
+    Row(panel, "Peak amplitude", Fmt.Fixed(spectrum.Amplitudes[k], 4));
+}
+@ Replacing the content would scroll back to the top on every change, which makes a long
+inspector unreadable during a drag. So the offset is saved and restored around the swap.
+
+<<Win InspectorWindow: keeping the scroll position>>=
+double offset = _scroll.VerticalOffset;
+_scroll.Content = panel;
+_scroll.ScrollToVerticalOffset(offset);
+@ A section title is a bold line. A row puts the label on the left and the value on the right, in
+a read-only, borderless text box: that is how WPF makes text selectable, the equivalent of
+[[.textSelection(.enabled)]] in Swift.
+
+<<Win InspectorWindow: section and row helpers>>=
+private static void Section(Panel panel, string title) =>
+    panel.Children.Add(new TextBlock { Text = title, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 12, 0, 4) });
+
+private static void Row(Panel panel, string label, string value)
+{
+    var grid = new Grid { Margin = new Thickness(0, 2, 0, 2) };
+    grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+    grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+    grid.Children.Add(new TextBlock { Text = label, Margin = new Thickness(0, 0, 12, 0) });
+    // A read-only, borderless TextBox so values can be selected and copied.
+    var text = new TextBox
+    {
+        Text = value, IsReadOnly = true, BorderThickness = new Thickness(0), Background = null, Padding = new Thickness(0),
+        TextAlignment = TextAlignment.Right, TextWrapping = TextWrapping.Wrap,
+    };
+    Grid.SetColumn(text, 1);
+    grid.Children.Add(text);
+    panel.Children.Add(grid);
+}
+@

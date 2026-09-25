@@ -178,6 +178,11 @@ def doc_line(line: str) -> str:
     return QUOTE_RE.sub(lambda m: tex_code(m.group(1)), line)
 
 
+LANGUAGE_BY_EXTENSION = {
+    ".swift": "Swift", ".cs": "CSharp", ".csproj": "XML", ".xaml": "XML", ".manifest": "XML",
+}
+
+
 def languages(web: Web) -> dict[str, str]:
     """Listing language for every chunk, from the extension of the root file it tangles into."""
     result: dict[str, str] = {}
@@ -193,7 +198,7 @@ def languages(web: Web) -> dict[str, str]:
                     visit(m.group(2).strip(), lang)
 
     for root in web.roots():
-        visit(root, "Swift" if root.endswith(".swift") else "")
+        visit(root, LANGUAGE_BY_EXTENSION.get(Path(root).suffix, ""))
     return result
 
 

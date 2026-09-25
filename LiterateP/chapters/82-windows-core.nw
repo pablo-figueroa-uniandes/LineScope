@@ -1,0 +1,1989 @@
+\chapter{The Numeric Core in C\#}\label{ch:win-core}
+
+The Windows port of LineScope is written in C\# for .NET~9, with a WPF user interface. Like the
+macOS program it is split in two, and this chapter covers the first half: [[LineScope.Core]], a
+class library with no user interface that ports the Swift package [[LineScopeCore]] file by
+file. [[PixelBuffer.swift]] becomes [[PixelBuffer.cs]], [[Resampling.swift]] becomes
+[[Resampling.cs]], and so on, and the types keep their names in PascalCase.
+
+The mathematics is not repeated here. It was derived in the chapters on pixels
+(Chapter~\ref{ch:pixels}), resampling (Chapter~\ref{ch:resampling}), filters
+(Chapter~\ref{ch:filters}), analysis (Chapter~\ref{ch:analysis}) and test patterns
+(Chapter~\ref{ch:patterns}), and it holds unchanged. This chapter concentrates on the three places
+where the port had to differ, because the macOS frameworks it relied on don't exist on Windows:
+\begin{itemize}
+\item the bridge to 8-bit images, which is premultiplied BGRA instead of Core Graphics' RGBA
+  (Section~\ref{sec:win-bgra});
+\item the filters that Core Image supplied, now written out on the CPU
+  (Section~\ref{sec:win-filters});
+\item the FFT that vDSP supplied, now a hand-written radix-2 transform (Section~\ref{sec:win-fft}).
+\end{itemize}
+Everywhere else the rule is the opposite: the port is kept \emph{identical} to the Swift code.
+The resampling kernels and weights, the line sampler, the color conversions, the normalization of
+the spectrum, the pattern formulas and the SplitMix64 generator compute the same numbers, so a
+profile or a spectrum on Windows matches the one on macOS to floating-point precision. Where C\#
+and Swift differ in some small default (rounding, remainders, integer overflow), the C\# code
+says explicitly what the Swift code meant. Those spots are pointed out as they come.
+
+\section{The project file}\label{sec:win-core-project}
+
+The library is an SDK-style project. It targets plain [[net9.0]], not [[net9.0-windows]]: nothing
+in the core touches WPF or the Windows Imaging Component, so it builds and its tests run on any
+platform .NET supports. All the Windows-specific code lives in the app.
+
+<<Windows/LineScope.Core/LineScope.Core.csproj>>=
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <<Win Core project: target and language options>>
+    <<Win Core project: optimizing Debug builds>>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="LineScope.Core.Tests" />
+  </ItemGroup>
+
+</Project>
+@ Implicit usings give every file [[System]], [[System.Linq]], [[System.Collections.Generic]] and
+[[System.Threading.Tasks]] (where [[Parallel]] lives), which is why most files below start directly
+with their namespace. Nullable reference types are on, so a [[PixelBuffer?]] that may be missing
+is marked as such, the counterpart of a Swift optional. The [[InternalsVisibleTo]] item plays the
+role of Swift's [[@testable import]]: the test project can reach internal members such as the
+contribution tables of the resampler and the FFT.
+
+<<Win Core project: target and language options>>=
+<TargetFramework>net9.0</TargetFramework>
+<ImplicitUsings>enable</ImplicitUsings>
+<Nullable>enable</Nullable>
+<RootNamespace>LineScope.Core</RootNamespace>
+@ The Swift package asks for [[-O]] even in Debug builds, because unoptimized pixel loops are tens
+of times slower, as the introduction explains. The same holds for .NET: a Debug build
+normally tells the JIT compiler not to optimize, so that a debugger can inspect every local
+variable. [[Optimize]] set unconditionally undoes that for this one assembly. Debugging the core
+becomes a little harder, and the app stays usable in Debug.
+
+<<Win Core project: optimizing Debug builds>>=
+<!-- Pixel loops are unusably slow unoptimized; optimize even in Debug (like the Swift package's -O). -->
+<Optimize>true</Optimize>
+@
+
+\section{Pixels}\label{sec:win-pixels}
+
+The representation is the one of Chapter~\ref{ch:pixels}: interleaved RGBA, 32-bit floats in
+$[0,1]$, row 0 at the top, sRGB-encoded values with straight alpha. Only the type that holds it
+changes.
+
+<<Windows/LineScope.Core/PixelBuffer.cs>>=
+namespace LineScope.Core;
+
+<<Win PixelBuffer: the color sample [[Rgba]]>>
+
+<<Win PixelBuffer: the class>>
+@ A color sample is a [[readonly record struct]]. The positional syntax declares the four
+components, a constructor with an optional alpha, and value equality in one line, which is what the
+Swift struct [[RGBA]] spelled out by hand.
+
+<<Win PixelBuffer: the color sample [[Rgba]]>>=
+/// <summary>A color sample with straight (non-premultiplied) alpha, sRGB-encoded components in 0…1.</summary>
+public readonly record struct Rgba(float R, float G, float B, float A = 1);
+@ \subsection{A class treated as a value}
+
+In Swift, [[PixelBuffer]] is a struct over a copy-on-write array: passing it around is free, and
+mutating a copy never affects the original. C\# has nothing like copy-on-write. A struct holding a
+[[float]] array would copy only the reference to the array, so two ``copies'' would share their pixels
+and the value semantics would be an illusion. The port therefore makes the buffer a
+[[sealed class]] and adopts a convention instead: \emph{treat instances as values}. Every
+operation returns a new buffer and leaves its input alone; code that wants to change pixels first
+calls [[Clone]]. The session can then hand the same buffer to a background task and to a view
+without locks, exactly as with the Swift struct.
+
+<<Win PixelBuffer: the class>>=
+/// <summary>
+/// Interleaved RGBA Float32 image. Row 0 is the top row.
+/// Components are sRGB-encoded (not linearized) with straight alpha, so values match what is displayed.
+/// Treat instances as values: operations return new buffers instead of mutating their input.
+/// </summary>
+public sealed class PixelBuffer : IEquatable<PixelBuffer>
+{
+    <<Win PixelBuffer: properties and constructors>>
+
+    <<Win PixelBuffer: pixel indexer>>
+
+    public PixelBuffer Clone() => new(Width, Height, (float[])Data.Clone());
+
+    <<Win PixelBuffer: premultiplication>>
+
+    <<Win PixelBuffer: premultiplied BGRA bridge>>
+
+    <<Win PixelBuffer: value equality>>
+}
+@ The designated constructor checks the same invariant as the Swift [[precondition]], but throws an
+[[ArgumentException]], the .NET way to reject bad arguments. The filling constructor chains to it,
+and chaining has a trap: the array allocated in the argument list is evaluated \emph{before} the validating
+constructor runs, and a negative length would throw an [[OverflowException]] with a less helpful
+message. Clamping the dimensions to zero first lets the size check report the error. A second
+constructor without a color stands in for Swift's default argument, since a default parameter
+value in C\# must be a compile-time constant and a [[Rgba]] isn't one.
+
+<<Win PixelBuffer: properties and constructors>>=
+public int Width { get; }
+public int Height { get; }
+public float[] Data { get; }
+
+public PixelBuffer(int width, int height, float[] data)
+{
+    if (width <= 0 || height <= 0 || data.Length != width * height * 4)
+        throw new ArgumentException("Invalid pixel buffer dimensions.");
+    Width = width;
+    Height = height;
+    Data = data;
+}
+
+public PixelBuffer(int width, int height) : this(width, height, new Rgba(0, 0, 0, 1)) { }
+
+public PixelBuffer(int width, int height, Rgba fill)
+    : this(width, height, new float[Math.Max(width, 0) * Math.Max(height, 0) * 4])
+{
+    for (int i = 0; i < Data.Length; i += 4)
+    {
+        Data[i] = fill.R;
+        Data[i + 1] = fill.G;
+        Data[i + 2] = fill.B;
+        Data[i + 3] = fill.A;
+    }
+}
+@ The Swift two-argument subscript becomes an indexer with the same index formula. The [[Data]]
+property has no setter, but the array it returns is mutable; that is what lets the indexer's
+setter, and the hot loops elsewhere, write into it. C\# arrays are bounds-checked like Swift's, but
+the JIT compiler removes many of the checks in simple loops, so the port indexes [[Data]] directly
+where Swift needed unsafe buffer pointers.
+
+<<Win PixelBuffer: pixel indexer>>=
+public Rgba this[int x, int y]
+{
+    get
+    {
+        int i = (y * Width + x) * 4;
+        return new Rgba(Data[i], Data[i + 1], Data[i + 2], Data[i + 3]);
+    }
+    set
+    {
+        int i = (y * Width + x) * 4;
+        Data[i] = value.R;
+        Data[i + 1] = value.G;
+        Data[i + 2] = value.B;
+        Data[i + 3] = value.A;
+    }
+}
+@ Premultiplication is Section~\ref{sec:premultiply} line for line, with [[Math.Clamp]] for
+[[min(max(...))]]. One difference is deliberate. Swift's [[fromPremultiplied]] copies its argument
+before converting (the copy is free until written, and then it's a real copy). The C\# version
+converts \emph{in place} and wraps the same array in the new buffer, saving one image-sized
+allocation per filter or resampling. This is safe because every caller passes an array it has
+just created and never touches again; the method is [[internal]], so no one else can call it.
+
+<<Win PixelBuffer: premultiplication>>=
+// Premultiplication (used by resampling and the blur filters, which work on premultiplied data)
+
+internal float[] Premultiplied()
+{
+    var output = (float[])Data.Clone();
+    for (int i = 0; i < output.Length; i += 4)
+    {
+        float a = output[i + 3];
+        output[i] *= a;
+        output[i + 1] *= a;
+        output[i + 2] *= a;
+    }
+    return output;
+}
+
+/// <summary>Un-premultiplies (in place) and clamps to 0…1.</summary>
+internal static PixelBuffer FromPremultiplied(int width, int height, float[] p)
+{
+    for (int i = 0; i < p.Length; i += 4)
+    {
+        float a = Math.Clamp(p[i + 3], 0, 1);
+        p[i + 3] = a;
+        if (a > 1e-6f)
+        {
+            p[i] = Math.Clamp(p[i] / a, 0, 1);
+            p[i + 1] = Math.Clamp(p[i + 1] / a, 0, 1);
+            p[i + 2] = Math.Clamp(p[i + 2] / a, 0, 1);
+        }
+        else
+        {
+            p[i] = 0;
+            p[i + 1] = 0;
+            p[i + 2] = 0;
+        }
+    }
+    return new PixelBuffer(width, height, p);
+}
+@ \subsection{The 8-bit bridge}\label{sec:win-bgra}
+
+On macOS the buffer converts itself to and from a [[CGImage]], and Core Graphics does the
+decoding and color conversion. On Windows those jobs belong to the Windows Imaging Component
+(WIC) and to WPF, and both live in the app. The core only exchanges \emph{bytes} with them, which
+keeps it free of any UI dependency.
+
+The byte layout is the one WPF draws natively: [[Pbgra32]], four bytes per pixel in the order
+blue, green, red, alpha, with the colors premultiplied by alpha. (Read as a little-endian 32-bit
+integer, that is ARGB, the traditional Windows pixel.) The app asks WIC to convert every decoded
+image to this format, whatever its source layout, just as the Swift decoder draws every
+[[CGImage]] into an 8-bit premultiplied bitmap; and it wraps the bytes of a rendered buffer into a
+bitmap in this format without further conversion. Compared with the Swift code, only the order of
+the color bytes differs: red is at offset 2 and blue at offset 0.
+
+Decoding scales the bytes to $[0,1]$ and un-premultiplies, which is again where 16-bit sources
+lose their extra precision.
+
+<<Win PixelBuffer: premultiplied BGRA bridge>>=
+// 8-bit bridging (the Windows counterpart of the Core Graphics bridge). The byte layout is
+// premultiplied BGRA, which is what WIC's and WPF's Pbgra32 pixel format expects.
+
+/// <summary>Converts decoded 8-bit premultiplied BGRA pixels to a float buffer.</summary>
+public static PixelBuffer FromPremultipliedBgra8(int width, int height, byte[] bytes)
+{
+    if (bytes.Length < width * height * 4) throw new ArgumentException("Too few bytes.");
+    var p = new float[width * height * 4];
+    for (int i = 0; i < p.Length; i += 4)
+    {
+        p[i] = bytes[i + 2] / 255f;
+        p[i + 1] = bytes[i + 1] / 255f;
+        p[i + 2] = bytes[i] / 255f;
+        p[i + 3] = bytes[i + 3] / 255f;
+    }
+    return FromPremultiplied(width, height, p);
+}
+
+/// <summary>Renders the buffer as 8-bit premultiplied BGRA for display or export.</summary>
+public byte[] ToPremultipliedBgra8()
+{
+    var bytes = new byte[Data.Length];
+    for (int i = 0; i < Data.Length; i += 4)
+    {
+        float a = Math.Clamp(Data[i + 3], 0, 1);
+        bytes[i + 2] = ToByte(Math.Clamp(Data[i], 0, 1) * a);
+        bytes[i + 1] = ToByte(Math.Clamp(Data[i + 1], 0, 1) * a);
+        bytes[i] = ToByte(Math.Clamp(Data[i + 2], 0, 1) * a);
+        bytes[i + 3] = ToByte(a);
+    }
+    return bytes;
+}
+
+<<Win PixelBuffer: rounding to a byte>>
+@ Rounding to a byte is the first of the small defaults that differ between the languages. Swift's
+[[rounded()]] rounds halves away from zero; .NET's [[Math.Round]] rounds halves to the nearest
+\emph{even} integer unless told otherwise. A value of $126.5$ would become $127$ on macOS and
+$126$ on Windows. Asking for [[MidpointRounding.AwayFromZero]] makes the exported bytes agree.
+
+<<Win PixelBuffer: rounding to a byte>>=
+private static byte ToByte(float v) => (byte)MathF.Round(v * 255, MidpointRounding.AwayFromZero);
+@ Swift synthesizes [[Equatable]] for the struct. A class compares by reference unless told
+otherwise, so the port implements [[IEquatable]] by hand: same size and the same floats, compared
+as spans. The hash code combines only the dimensions. That is cheap and consistent with
+[[Equals]] (equal buffers have equal sizes), and buffers are compared in tests, not used as
+dictionary keys.
+
+<<Win PixelBuffer: value equality>>=
+public bool Equals(PixelBuffer? other) =>
+    other is not null && Width == other.Width && Height == other.Height && Data.AsSpan().SequenceEqual(other.Data);
+
+public override bool Equals(object? obj) => Equals(obj as PixelBuffer);
+
+public override int GetHashCode() => HashCode.Combine(Width, Height, Data.Length);
+@
+
+\section{Resampling}\label{sec:win-resampling}
+
+The resampler is the part of the port that must agree with macOS most closely, since comparing
+resampling methods is what LineScope is for. Kernels, supports, pixel-center convention, trimming
+and normalization are therefore exactly those of Chapter~\ref{ch:resampling}. The one real change
+is that both passes now run in parallel.
+
+<<Windows/LineScope.Core/Resampling.cs>>=
+namespace LineScope.Core;
+
+public enum ResampleMethod { Nearest, Tent, CatmullRom, Mitchell, Lanczos3, Sinc, Area }
+
+<<Win Resampling: method names as extension methods>>
+
+<<Win Resampling: the [[Resampler]] class>>
+@ A C\# enumeration is only a set of named integers; it can't have properties as a Swift enum can.
+The menu names therefore become extension methods in a companion static class, so that
+[[method.DisplayName()]] reads almost like Swift's [[method.displayName]]. [[All]] replaces
+[[CaseIterable]]. The switch expressions end in a discard arm, because the compiler can't prove
+that an enum variable holds one of the named values (any integer can be cast to it); here the
+discard stands for the last case.
+
+<<Win Resampling: method names as extension methods>>=
+public static class ResampleMethodInfo
+{
+    public static readonly ResampleMethod[] All = Enum.GetValues<ResampleMethod>();
+
+    public static string DisplayName(this ResampleMethod m) => m switch
+    {
+        ResampleMethod.Nearest => "Nearest Neighbor",
+        ResampleMethod.Tent => "Tent (Bilinear)",
+        ResampleMethod.CatmullRom => "Catmull-Rom (Bicubic)",
+        ResampleMethod.Mitchell => "Mitchell-Netravali",
+        ResampleMethod.Lanczos3 => "Lanczos-3",
+        ResampleMethod.Sinc => $"Sinc (truncated, r={(int)Resampler.SincRadius})",
+        _ => "Area Average",
+    };
+
+    public static string ShortName(this ResampleMethod m) => m switch
+    {
+        ResampleMethod.Nearest => "Nearest",
+        ResampleMethod.Tent => "Tent",
+        ResampleMethod.CatmullRom => "Catmull-Rom",
+        ResampleMethod.Mitchell => "Mitchell",
+        ResampleMethod.Lanczos3 => "Lanczos",
+        ResampleMethod.Sinc => "Sinc",
+        _ => "Area",
+    };
+}
+@ The caseless Swift enum used as a namespace becomes a [[static class]], and its Markdown
+documentation becomes an XML comment with the same text.
+
+<<Win Resampling: the [[Resampler]] class>>=
+/// <summary>
+/// Separable resampling with explicit, textbook kernels.
+/// </summary>
+/// <remarks>
+/// Coordinates follow the pixel-center convention: input pixel <c>j</c> covers <c>[j, j+1)</c> and its center is <c>j + 0.5</c>.
+/// Output pixel <c>i</c> maps to input position <c>(i + 0.5) / scale</c>.
+/// <list type="bullet">
+/// <item><c>Nearest</c> picks one source pixel and does no prefiltering, so it aliases when downscaling.</item>
+/// <item>The kernel methods (tent, Catmull-Rom, Mitchell, Lanczos, sinc) widen their kernel by <c>1/scale</c>
+/// when downscaling (antialiased).</item>
+/// <item><c>Area</c> weights source pixels by how much of the output pixel's footprint they cover.</item>
+/// </list>
+/// </remarks>
+public static class Resampler
+{
+    <<Win Resampler: sinc radius and output size>>
+
+    <<Win Resampler: resampling by a scale factor>>
+
+    <<Win Resampler: resampling to a given size>>
+
+    // Kernels
+
+    <<Win Resampler: contributions of input pixels>>
+
+    <<Win Resampler: trimming and normalizing weights>>
+
+    <<Win Resampler: the kernels>>
+}
+@ The output size rounds the scaled size with [[MidpointRounding.AwayFromZero]], for the reason
+given with [[ToByte]] above: halving an image 5 pixels wide must give 3 pixels on both platforms,
+not 2 on one of them.
+
+<<Win Resampler: sinc radius and output size>>=
+/// <summary>Half-width of the truncated sinc kernel, in source pixels (before widening).</summary>
+public const double SincRadius = 8.0;
+
+public static int OutputSize(int size, double scale) =>
+    Math.Max(1, (int)Math.Round(size * scale, MidpointRounding.AwayFromZero));
+@ Overloading replaces Swift's argument labels: [[Resample(src, scale, method)]] and
+[[Resample(src, width, height, method)]] are told apart by their parameter types.
+
+<<Win Resampler: resampling by a scale factor>>=
+public static PixelBuffer Resample(PixelBuffer src, double scale, ResampleMethod method) =>
+    Resample(src, OutputSize(src.Width, scale), OutputSize(src.Height, scale), method);
+@
+<<Win Resampler: resampling to a given size>>=
+public static PixelBuffer Resample(PixelBuffer src, int width, int height, ResampleMethod method)
+{
+    var premul = src.Premultiplied();
+    var xContrib = Contributions(src.Width, width, method);
+    var yContrib = Contributions(src.Height, height, method);
+
+    <<Win Resampler: horizontal pass>>
+
+    <<Win Resampler: vertical pass>>
+
+    return PixelBuffer.FromPremultiplied(width, height, output);
+}
+@ The two passes are the loops of Chapter~\ref{ch:resampling}, with the outer loop over rows
+replaced by [[Parallel.For]]. Each iteration of the horizontal pass reads one source row and
+writes one row of the intermediate image, so the iterations share nothing but read-only data, and
+they can run on all cores without locks. Parallelism doesn't change the result: every output
+component is still the same sum, accumulated in the same order, so the image is bit-identical
+to that of a serial loop.
+
+<<Win Resampler: horizontal pass>>=
+// Horizontal pass: (src.Width x src.Height) -> (width x src.Height)
+var tmp = new float[width * src.Height * 4];
+Parallel.For(0, src.Height, y =>
+{
+    int srcRow = y * src.Width * 4;
+    int dstRow = y * width * 4;
+    for (int x = 0; x < width; x++)
+    {
+        var c = xContrib[x];
+        float r = 0, g = 0, b = 0, a = 0;
+        for (int k = 0; k < c.Weights.Length; k++)
+        {
+            float w = c.Weights[k];
+            int si = srcRow + (c.Start + k) * 4;
+            r += premul[si] * w;
+            g += premul[si + 1] * w;
+            b += premul[si + 2] * w;
+            a += premul[si + 3] * w;
+        }
+        int di = dstRow + x * 4;
+        tmp[di] = r;
+        tmp[di + 1] = g;
+        tmp[di + 2] = b;
+        tmp[di + 3] = a;
+    }
+});
+@ The vertical pass is parallel over \emph{output} rows. Each one accumulates several input rows,
+and input rows are shared between neighboring output rows, but they are only read; every output
+row is written by exactly one iteration. C\# arrays start out zeroed, so the accumulation needs no
+explicit initialization, just as the Swift array created with [[repeating: 0]].
+
+<<Win Resampler: vertical pass>>=
+// Vertical pass: (width x src.Height) -> (width x height)
+var output = new float[width * height * 4];
+int rowStride = width * 4;
+Parallel.For(0, height, y =>
+{
+    var c = yContrib[y];
+    int dstRow = y * rowStride;
+    for (int k = 0; k < c.Weights.Length; k++)
+    {
+        float w = c.Weights[k];
+        int srcRow = (c.Start + k) * rowStride;
+        for (int i = 0; i < rowStride; i++)
+            output[dstRow + i] += tmp[srcRow + i] * w;
+    }
+});
+@ A [[Contribution]] becomes a [[readonly record struct]], and the table an array filled by index
+rather than appended to. The rounding helpers translate one to one: [[rounded(.down)]] is
+[[Math.Floor]] and [[rounded(.up)]] is [[Math.Ceiling]], both followed by a cast to [[int]].
+
+<<Win Resampler: contributions of input pixels>>=
+internal readonly record struct Contribution(int Start, float[] Weights);
+
+internal static Contribution[] Contributions(int inSize, int outSize, ResampleMethod method)
+{
+    double scale = (double)outSize / inSize;
+    var result = new Contribution[outSize];
+
+    for (int i = 0; i < outSize; i++)
+    {
+        double center = (i + 0.5) / scale;
+        switch (method)
+        {
+            <<Win Resampler: nearest-neighbor contribution>>
+            <<Win Resampler: area-average contribution>>
+            <<Win Resampler: kernel contribution>>
+        }
+    }
+    return result;
+}
+@ The three cases are those of Chapter~\ref{ch:resampling}. Each is wrapped in braces, so that
+the local names [[first]], [[last]] and [[weights]] of one case don't collide with those of the
+next; in C\# all the cases of a [[switch]] share one scope. The kernel methods fall into the
+[[default]] arm.
+
+<<Win Resampler: nearest-neighbor contribution>>=
+case ResampleMethod.Nearest:
+{
+    int j = Math.Clamp((int)Math.Floor(center), 0, inSize - 1);
+    result[i] = new Contribution(j, [1]);
+    break;
+}
+@ The Swift code guards its loops with [[if last >= first]], because a closed range
+[[first...last]] with $\mathit{last} < \mathit{first}$ traps at run time. A C\# [[for]] loop simply
+runs zero times, so the guard disappears and an empty weight list goes to the fallback in
+[[Normalized]], as before.
+
+<<Win Resampler: area-average contribution>>=
+case ResampleMethod.Area:
+{
+    // Output pixel footprint in input coordinates, exact coverage weights.
+    double half = 0.5 / scale;
+    double lo = center - half;
+    double hi = center + half;
+    int first = Math.Max(0, (int)Math.Floor(lo));
+    int last = Math.Min(inSize - 1, (int)Math.Ceiling(hi) - 1);
+    var weights = new List<float>();
+    for (int j = first; j <= last; j++)
+    {
+        double overlap = Math.Min(hi, j + 1) - Math.Max(lo, j);
+        weights.Add((float)Math.Max(0, overlap));
+    }
+    result[i] = Normalized(first, weights, center, inSize);
+    break;
+}
+@
+<<Win Resampler: kernel contribution>>=
+default:
+{
+    double filterScale = Math.Max(1, 1 / scale);
+    double support = KernelSupport(method) * filterScale;
+    int first = Math.Max(0, (int)Math.Floor(center - support));
+    int last = Math.Min(inSize - 1, (int)Math.Ceiling(center + support));
+    var weights = new List<float>();
+    for (int j = first; j <= last; j++)
+    {
+        double x = (j + 0.5 - center) / filterScale;
+        weights.Add((float)Kernel(method, x));
+    }
+    result[i] = Normalized(first, weights, center, inSize);
+    break;
+}
+@ Trimming and normalizing are unchanged, including the arithmetic type: the sum of the weights is
+a [[float]], accumulated from left to right as Swift's [[reduce]] does. The test is written as
+[[!(Math.Abs(sum) > 1e-12)]] rather than [[Math.Abs(sum) <= 1e-12]] so that it keeps the meaning
+of Swift's [[guard abs(sum) > 1e-12 else]] when the sum is not a number: a NaN fails every
+comparison, and both versions then take the fallback.
+
+<<Win Resampler: trimming and normalizing weights>>=
+private static Contribution Normalized(int start, List<float> weights, double center, int inSize)
+{
+    // Trim zero weights at both ends to keep inner loops short.
+    int first = 0;
+    int last = weights.Count - 1;
+    while (first <= last && weights[first] == 0) first++;
+    while (last >= first && weights[last] == 0) last--;
+    int fallback = Math.Clamp((int)Math.Floor(center), 0, inSize - 1);
+    if (first > last) return new Contribution(fallback, [1]);
+    var trimmed = weights.GetRange(first, last - first + 1);
+    float sum = 0;
+    foreach (float w in trimmed) sum += w;
+    if (!(Math.Abs(sum) > 1e-12)) return new Contribution(fallback, [1]);
+    return new Contribution(start + first, trimmed.Select(w => w / sum).ToArray());
+}
+@ The kernels are Chapter~\ref{ch:resampling}'s formulas, transcribed: the box, the tent, the
+BC-splines of Mitchell and Netravali with $(B,C) = (0,\frac12)$ and $(\frac13,\frac13)$, Lanczos-3
+and the truncated sinc. They are evaluated in [[double]] and only then converted to [[float]], in
+the same places as in Swift.
+
+<<Win Resampler: the kernels>>=
+internal static double KernelSupport(ResampleMethod method) => method switch
+{
+    ResampleMethod.Nearest or ResampleMethod.Area => 0.5,
+    ResampleMethod.Tent => 1,
+    ResampleMethod.CatmullRom or ResampleMethod.Mitchell => 2,
+    ResampleMethod.Lanczos3 => 3,
+    _ => SincRadius,
+};
+
+private static double Sinc(double x)
+{
+    if (Math.Abs(x) < 1e-9) return 1;
+    double px = Math.PI * x;
+    return Math.Sin(px) / px;
+}
+
+/// <summary>Mitchell-Netravali / Keys family: (B, C) = (1/3, 1/3) is Mitchell, (0, 1/2) is Catmull-Rom.</summary>
+private static double BcSpline(double ax, double b, double c)
+{
+    if (ax < 1)
+        return ((12 - 9 * b - 6 * c) * ax * ax * ax + (-18 + 12 * b + 6 * c) * ax * ax + (6 - 2 * b)) / 6;
+    if (ax < 2)
+        return ((-b - 6 * c) * ax * ax * ax + (6 * b + 30 * c) * ax * ax
+            + (-12 * b - 48 * c) * ax + (8 * b + 24 * c)) / 6;
+    return 0;
+}
+
+internal static double Kernel(ResampleMethod method, double x)
+{
+    double ax = Math.Abs(x);
+    return method switch
+    {
+        ResampleMethod.Nearest or ResampleMethod.Area => ax < 0.5 ? 1 : 0,
+        ResampleMethod.Tent => Math.Max(0, 1 - ax),
+        ResampleMethod.CatmullRom => BcSpline(ax, 0, 0.5),
+        ResampleMethod.Mitchell => BcSpline(ax, 1.0 / 3, 1.0 / 3),
+        ResampleMethod.Lanczos3 => ax < 3 ? Sinc(ax) * Sinc(ax / 3) : 0,
+        // Ideal low-pass, truncated (rectangular window): expect ringing near edges.
+        _ => ax < SincRadius ? Sinc(ax) : 0,
+    };
+}
+@
+
+\section{Filters}\label{sec:win-filters}
+
+Half of the filters of Chapter~\ref{ch:filters} were never LineScope's own code: the Gaussian
+and box blurs, the median, the unsharp mask and the noise reduction were Core Image built-ins,
+and Windows has no Core Image. The port writes all five out on the CPU. The other half (Sobel,
+Laplacian, emboss, grayscale, invert) was already CPU code and is ported directly.
+
+<<Windows/LineScope.Core/Filters.cs>>=
+namespace LineScope.Core;
+
+<<Win Filters: the [[FilterKind]] records>>
+
+<<Win Filters: the [[Filters]] class>>
+@ \subsection{Filter values}
+
+A Swift enumeration with associated values has no direct C\# equivalent. The idiom that comes
+closest is an abstract record with one nested sealed record per case. Records provide the value
+equality that [[Equatable]] gave, including for the parameters, and a [[switch]] on the type with
+positional patterns takes the place of [[case .gaussianBlur(let r)]]. Parameterless cases like
+[[Median]] are records without fields: any two instances compare equal. The hierarchy is open as
+far as the compiler knows, so each switch needs a discard arm that is never reached.
+
+<<Win Filters: the [[FilterKind]] records>>=
+public abstract record FilterKind
+{
+    <<Win Filters: one record per filter>>
+
+    <<Win Filters: display names>>
+}
+@
+<<Win Filters: one record per filter>>=
+public sealed record GaussianBlur(double Radius) : FilterKind;
+public sealed record BoxBlur(double Radius) : FilterKind;
+public sealed record Median : FilterKind;
+public sealed record UnsharpMask(double Radius, double Intensity) : FilterKind;
+public sealed record NoiseReduction(double Level, double Sharpness) : FilterKind;
+public sealed record Sobel : FilterKind;
+public sealed record Laplacian : FilterKind;
+public sealed record Emboss : FilterKind;
+public sealed record Grayscale : FilterKind;
+public sealed record Invert : FilterKind;
+@ The names are those of the Swift version, with the parameters formatted by [[Fmt.Number]]
+(Section~\ref{sec:win-formatting}), the port's counterpart of the helper [[fmt]].
+
+<<Win Filters: display names>>=
+public string DisplayName => this switch
+{
+    GaussianBlur g => $"Gaussian r={Fmt.Number(g.Radius)}",
+    BoxBlur b => $"Box r={Fmt.Number(b.Radius)}",
+    Median => "Median 3×3",
+    UnsharpMask u => $"Sharpen r={Fmt.Number(u.Radius)} i={Fmt.Number(u.Intensity)}",
+    NoiseReduction n => $"Denoise {Fmt.Number(n.Level)}/{Fmt.Number(n.Sharpness)}",
+    Sobel => "Sobel",
+    Laplacian => "Laplacian",
+    Emboss => "Emboss",
+    Grayscale => "Grayscale",
+    Invert => "Invert",
+    _ => "",
+};
+@ \subsection{The filter class}
+
+The class's documentation comment is the specification of the replacements, and the rest of this
+section explains it item by item. Its layout mirrors the Swift file: dispatch, then the filters
+that replace Core Image, then the CPU filters that were already there.
+
+<<Win Filters: the [[Filters]] class>>=
+/// <summary>
+/// All filters run on the CPU and work directly on encoded values (no color management), with clamped edges.
+/// On macOS the blur, median, unsharp-mask and noise-reduction filters came from Core Image; here they are
+/// explicit implementations of the same operations:
+/// <list type="bullet">
+/// <item>Gaussian: separable kernel with σ = radius, truncated at 3σ (Core Image's radius is σ).</item>
+/// <item>Box: separable box covering [−(r+½), r+½], with fractional coverage at the ends.</item>
+/// <item>Median: 3×3 per-channel median.</item>
+/// <item>Unsharp mask: src + intensity·(src − Gaussian(src, radius)).</item>
+/// <item>Noise reduction: a threshold ("sigma") filter. Neighbors whose luminance differs from the center by less
+/// than the noise level are averaged; pixels on edges (a neighbor above the threshold) are sharpened instead,
+/// by <c>sharpness</c> times a 3×3 unsharp mask. This follows Core Image's documented behavior, not its exact kernel.</item>
+/// </list>
+/// The blurs work on premultiplied data, as Core Image did.
+/// </summary>
+public static class Filters
+{
+    <<Win Filters: dispatching a filter>>
+
+    <<Win Filters: running on premultiplied data>>
+
+    // Separable filters on premultiplied RGBA
+
+    <<Win Filters: separable convolution>>
+
+    <<Win Filters: the Gaussian kernel>>
+
+    <<Win Filters: the box kernel>>
+
+    <<Win Filters: the two blurs>>
+
+    <<Win Filters: unsharp mask>>
+
+    <<Win Filters: [[3x3]] median>>
+
+    <<Win Filters: noise reduction>>
+
+    // CPU filters on straight RGB
+
+    <<Win Filters: per-pixel color maps>>
+
+    <<Win Filters: [[3x3]] convolution>>
+
+    <<Win Filters: Sobel gradient magnitude>>
+}
+@ Dispatch is one switch expression. The five former Core Image filters go through
+[[Premultiplied]]; the rest are unchanged from Chapter~\ref{ch:filters}, kernels included.
+
+<<Win Filters: dispatching a filter>>=
+public static PixelBuffer Apply(FilterKind filter, PixelBuffer src) => filter switch
+{
+    FilterKind.GaussianBlur g => Premultiplied(src, p => GaussianBlur(p, src.Width, src.Height, g.Radius)),
+    FilterKind.BoxBlur b => Premultiplied(src, p => BoxBlur(p, src.Width, src.Height, b.Radius)),
+    FilterKind.Median => Premultiplied(src, p => Median3x3(p, src.Width, src.Height)),
+    FilterKind.UnsharpMask u => Premultiplied(src, p => UnsharpMask(p, src.Width, src.Height, u.Radius, u.Intensity)),
+    FilterKind.NoiseReduction n => Premultiplied(src, p => NoiseReduction(p, src.Width, src.Height, n.Level, n.Sharpness)),
+    FilterKind.Sobel => Sobel(src),
+    // Absolute response so the edges are visible.
+    FilterKind.Laplacian => Convolve3x3(src, [0, 1, 0, 1, -4, 1, 0, 1, 0], absolute: true),
+    FilterKind.Emboss => Convolve3x3(src, [-2, -1, 0, -1, 1, 1, 0, 1, 2], absolute: false),
+    FilterKind.Grayscale => MapRgb(src, c =>
+    {
+        float y = 0.2126f * c.R + 0.7152f * c.G + 0.0722f * c.B;
+        return new Rgba(y, y, y, c.A);
+    }),
+    FilterKind.Invert => MapRgb(src, c => new Rgba(1 - c.R, 1 - c.G, 1 - c.B, c.A)),
+    _ => src,
+};
+@ This helper is what is left of the Core Image bridge. The Swift [[applyCI]] premultiplied the
+buffer, wrapped it as a [[CIImage]] without a color space, filtered, and un-premultiplied the
+result. Here the filter is simply a function from premultiplied floats to premultiplied floats.
+Both halves of the Core Image setup that mattered survive in spirit: there is no color
+management, because nothing here knows about color spaces, and the edges are clamped, as
+[[clampedToExtent]] did, by the index clamping in every loop below.
+
+<<Win Filters: running on premultiplied data>>=
+private static PixelBuffer Premultiplied(PixelBuffer src, Func<float[], float[]> body) =>
+    PixelBuffer.FromPremultiplied(src.Width, src.Height, body(src.Premultiplied()));
+@ \subsection{Separable blurs}
+
+Both blurs convolve with a symmetric one-dimensional kernel, first along the rows and then along
+the columns, like the resampler (Chapter~\ref{ch:resampling}). Unlike the resampler, the image
+keeps its size, and a tap that falls outside the image reads the nearest border pixel. The two
+passes are parallel over rows, and each pass writes a fresh array, so no iteration reads what
+another one writes.
+
+<<Win Filters: separable convolution>>=
+/// <summary>Convolves every channel with a symmetric 1-D kernel (index <c>radius</c> is the center) along x, then y.</summary>
+internal static float[] ConvolveSeparable(float[] src, int w, int h, float[] kernel)
+{
+    int r = kernel.Length / 2;
+    var tmp = new float[src.Length];
+    Parallel.For(0, h, y =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            for (int k = -r; k <= r; k++)
+            {
+                int xx = Math.Clamp(x + k, 0, w - 1);
+                int i = (y * w + xx) * 4;
+                float wt = kernel[k + r];
+                a0 += src[i] * wt; a1 += src[i + 1] * wt; a2 += src[i + 2] * wt; a3 += src[i + 3] * wt;
+            }
+            int o = (y * w + x) * 4;
+            tmp[o] = a0; tmp[o + 1] = a1; tmp[o + 2] = a2; tmp[o + 3] = a3;
+        }
+    });
+    var output = new float[src.Length];
+    Parallel.For(0, h, y =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            for (int k = -r; k <= r; k++)
+            {
+                int yy = Math.Clamp(y + k, 0, h - 1);
+                int i = (yy * w + x) * 4;
+                float wt = kernel[k + r];
+                a0 += tmp[i] * wt; a1 += tmp[i + 1] * wt; a2 += tmp[i + 2] * wt; a3 += tmp[i + 3] * wt;
+            }
+            int o = (y * w + x) * 4;
+            output[o] = a0; output[o + 1] = a1; output[o + 2] = a2; output[o + 3] = a3;
+        }
+    });
+    return output;
+}
+@ Apple documents the radius of [[CIGaussianBlur]] as the standard deviation of the Gaussian,
+so the port takes $\sigma = r$. The kernel
+\[
+  g_i = \frac{e^{-i^2/2\sigma^2}}{\sum_{j=-R}^{R} e^{-j^2/2\sigma^2}},
+  \qquad |i| \le R = \max\bigl(1, \lceil 3\sigma\rceil\bigr),
+\]
+is truncated at $3\sigma$, where the Gaussian has fallen to about $1\%$ of its peak and the
+omitted tails hold less than $0.3\%$ of its mass; dividing by the sum restores the rest, so a flat
+image stays flat. A radius below $10^{-3}$ is the identity.
+
+<<Win Filters: the Gaussian kernel>>=
+internal static float[] GaussianKernel(double sigma)
+{
+    if (sigma < 1e-3) return [1];
+    int r = Math.Max(1, (int)Math.Ceiling(3 * sigma));
+    var k = new float[2 * r + 1];
+    double sum = 0;
+    for (int i = -r; i <= r; i++)
+    {
+        double v = Math.Exp(-(i * i) / (2 * sigma * sigma));
+        k[i + r] = (float)v;
+        sum += v;
+    }
+    for (int i = 0; i < k.Length; i++) k[i] = (float)(k[i] / sum);
+    return k;
+}
+@ The box blur must accept fractional radii, since the parameter sheet does. The port treats the
+box as the continuous interval $[-(r+\frac12),\ r+\frac12]$ and weights each tap $i$ by the part of
+its pixel $[i-\frac12, i+\frac12]$ that the interval covers. This is the area-averaging rule of
+Chapter~\ref{ch:resampling} applied to a filter. With $r = 1$ the box covers three whole pixels,
+with $r = 0$ it is the identity, and with $r = 1.5$ the weights are
+$\frac14(\frac12, 1, 1, 1, \frac12)$, so the result changes smoothly as the radius does.
+
+<<Win Filters: the box kernel>>=
+internal static float[] BoxKernel(double radius)
+{
+    double half = Math.Max(radius, 0) + 0.5;
+    int r = (int)Math.Ceiling(half - 0.5);
+    var k = new float[2 * r + 1];
+    double sum = 0;
+    for (int i = -r; i <= r; i++)
+    {
+        double overlap = Math.Min(i + 0.5, half) - Math.Max(i - 0.5, -half);
+        k[i + r] = (float)Math.Max(0, overlap);
+        sum += k[i + r];
+    }
+    for (int i = 0; i < k.Length; i++) k[i] = (float)(k[i] / sum);
+    return k;
+}
+@
+<<Win Filters: the two blurs>>=
+private static float[] GaussianBlur(float[] p, int w, int h, double radius) =>
+    ConvolveSeparable(p, w, h, GaussianKernel(radius));
+
+private static float[] BoxBlur(float[] p, int w, int h, double radius) =>
+    ConvolveSeparable(p, w, h, BoxKernel(radius));
+@ \subsection{Sharpening, median and noise reduction}
+
+The unsharp mask is the formula of Chapter~\ref{ch:filters},
+$\mathit{out} = \mathit{src} + \mathit{intensity}\times(\mathit{src} - G_r * \mathit{src})$, with
+the Gaussian just defined. It is applied to the three premultiplied color components; alpha is
+copied, so sharpening never makes an opaque image partly transparent. Overshoot is left in the
+result and clamped when the buffer is un-premultiplied.
+
+<<Win Filters: unsharp mask>>=
+private static float[] UnsharpMask(float[] p, int w, int h, double radius, double intensity)
+{
+    var blurred = GaussianBlur(p, w, h, radius);
+    float amount = (float)intensity;
+    var output = new float[p.Length];
+    for (int i = 0; i < p.Length; i += 4)
+    {
+        for (int c = 0; c < 3; c++)
+            output[i + c] = p[i + c] + amount * (p[i + c] - blurred[i + c]);
+        output[i + 3] = p[i + 3];
+    }
+    return output;
+}
+@ The median takes, for each channel separately, the middle one of the nine values in the
+$3\times3$ neighborhood. Sorting nine floats is fast enough; the only care taken is not to
+allocate the nine-element window once per pixel. The overload of [[Parallel.For]] with
+thread-local state gives every worker thread its own window, created once by the [[localInit]] delegate
+and passed from one row to the next.
+
+<<Win Filters: [[3x3]] median>>=
+private static float[] Median3x3(float[] p, int w, int h)
+{
+    var output = new float[p.Length];
+    Parallel.For(0, h, () => new float[9], (y, _, window) =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            int o = (y * w + x) * 4;
+            for (int c = 0; c < 4; c++)
+            {
+                int n = 0;
+                for (int ky = -1; ky <= 1; ky++)
+                {
+                    int yy = Math.Clamp(y + ky, 0, h - 1);
+                    for (int kx = -1; kx <= 1; kx++)
+                    {
+                        int xx = Math.Clamp(x + kx, 0, w - 1);
+                        window[n++] = p[(yy * w + xx) * 4 + c];
+                    }
+                }
+                Array.Sort(window);
+                output[o + c] = window[4];
+            }
+        }
+        return window;
+    }, _ => { });
+    return output;
+}
+@ Core Image's noise reduction is documented only in words: changes in luminance smaller than the
+noise level count as noise and are smoothed, larger ones count as edges and are sharpened by the
+sharpness amount. The port implements that description as a \emph{threshold} (or ``sigma'')
+filter on the $3\times3$ neighborhood. It first computes the Rec.~709 luma of every pixel, with
+the grayscale filter's weights.
+
+<<Win Filters: noise reduction>>=
+private static float[] NoiseReduction(float[] p, int w, int h, double level, double sharpness)
+{
+    float threshold = (float)level;
+    float amount = (float)sharpness;
+    var luma = new float[w * h];
+    for (int i = 0; i < luma.Length; i++)
+        luma[i] = 0.2126f * p[i * 4] + 0.7152f * p[i * 4 + 1] + 0.0722f * p[i * 4 + 2];
+
+    var output = new float[p.Length];
+    Parallel.For(0, h, y =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            <<Win Filters: noise reduction, scanning the neighborhood>>
+            <<Win Filters: noise reduction, smoothing or sharpening>>
+        }
+    });
+    return output;
+}
+@ One pass over the nine neighbors gathers two sums: [[m]], of all of them, and [[s]], of those
+whose luma is within the threshold of the center's. A neighbor outside the threshold marks the
+pixel as lying on an edge.
+
+<<Win Filters: noise reduction, scanning the neighborhood>>=
+int ci = y * w + x;
+float center = luma[ci];
+bool edge = false;
+float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+float m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+int count = 0;
+for (int ky = -1; ky <= 1; ky++)
+{
+    int yy = Math.Clamp(y + ky, 0, h - 1);
+    for (int kx = -1; kx <= 1; kx++)
+    {
+        int xx = Math.Clamp(x + kx, 0, w - 1);
+        int ni = yy * w + xx;
+        int i = ni * 4;
+        m0 += p[i]; m1 += p[i + 1]; m2 += p[i + 2]; m3 += p[i + 3];
+        if (MathF.Abs(luma[ni] - center) < threshold)
+        {
+            s0 += p[i]; s1 += p[i + 1]; s2 += p[i + 2]; s3 += p[i + 3];
+            count++;
+        }
+        else
+        {
+            edge = true;
+        }
+    }
+}
+@ An edge pixel is sharpened by an unsharp mask whose blur is the $3\times3$ mean,
+$\mathit{out} = p + \mathit{sharpness}\times(p - \bar m)$, with alpha kept. Any other pixel is
+replaced by the mean of the neighbors within the threshold. Because smoothing happens only when
+\emph{no} neighbor crossed the threshold, that mean is in practice over all nine; the count is kept
+so that the division is safe whatever the test says. A noise level of $0$ makes every pixel an
+edge, so the filter becomes a pure sharpener, and a large level turns it into a $3\times3$ box blur.
+
+<<Win Filters: noise reduction, smoothing or sharpening>>=
+int o = ci * 4;
+if (edge || count == 0)
+{
+    // Edge: unsharp mask against the 3×3 mean.
+    output[o] = p[o] + amount * (p[o] - m0 / 9);
+    output[o + 1] = p[o + 1] + amount * (p[o + 1] - m1 / 9);
+    output[o + 2] = p[o + 2] + amount * (p[o + 2] - m2 / 9);
+    output[o + 3] = p[o + 3];
+}
+else
+{
+    output[o] = s0 / count;
+    output[o + 1] = s1 / count;
+    output[o + 2] = s2 / count;
+    output[o + 3] = s3 / count;
+}
+@ \subsection{Why the results differ from macOS}\label{sec:win-filter-differences}
+
+For resampling, the port can promise the same numbers as macOS because both sides run the same
+explicit algorithm. For these five filters it can't. Core Image documents what its filters do,
+not how: how many taps its Gaussian uses and how it handles large radii, the exact shape of its
+box, the kernel behind its noise reduction. It also runs on the GPU, often with reduced
+intermediate precision. The C\# filters follow the documented behavior with the simplest exact
+algorithm, so a Gaussian blur of radius 2 looks the same on both systems, but profiles compared
+pixel by pixel differ slightly, and noise reduction may differ visibly. A comparison \emph{between} methods on one machine is unaffected,
+and that is what LineScope is for. The Windows [[README.md]] lists the same caveats for users.
+
+\subsection{CPU filters}
+
+The remaining filters are the CPU code of Chapter~\ref{ch:filters}, with the same kernels,
+clamping and alpha handling. Two things change. The row loops are parallel. And the copy that
+receives the output is made with [[Clone]]: in Swift, [[var out = src]] copied the struct and
+copy-on-write duplicated the pixels at the first write, but with a class the same line would
+alias the input and the filter would overwrite the image it is reading.
+
+<<Win Filters: per-pixel color maps>>=
+private static PixelBuffer MapRgb(PixelBuffer src, Func<Rgba, Rgba> f)
+{
+    var output = src.Clone();
+    for (int y = 0; y < src.Height; y++)
+        for (int x = 0; x < src.Width; x++)
+            output[x, y] = f(src[x, y]);
+    return output;
+}
+@
+<<Win Filters: [[3x3]] convolution>>=
+/// <summary>3×3 convolution on RGB with clamped edges; alpha is preserved.</summary>
+internal static PixelBuffer Convolve3x3(PixelBuffer src, float[] k, bool absolute)
+{
+    var output = src.Clone();
+    int w = src.Width, h = src.Height;
+    var s = src.Data;
+    var o = output.Data;
+    Parallel.For(0, h, y =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            float a0 = 0, a1 = 0, a2 = 0;
+            for (int ky = -1; ky <= 1; ky++)
+            {
+                int yy = Math.Clamp(y + ky, 0, h - 1);
+                for (int kx = -1; kx <= 1; kx++)
+                {
+                    int xx = Math.Clamp(x + kx, 0, w - 1);
+                    float wgt = k[(ky + 1) * 3 + (kx + 1)];
+                    int i = (yy * w + xx) * 4;
+                    a0 += s[i] * wgt;
+                    a1 += s[i + 1] * wgt;
+                    a2 += s[i + 2] * wgt;
+                }
+            }
+            if (absolute) { a0 = MathF.Abs(a0); a1 = MathF.Abs(a1); a2 = MathF.Abs(a2); }
+            int j = (y * w + x) * 4;
+            o[j] = Math.Clamp(a0, 0, 1);
+            o[j + 1] = Math.Clamp(a1, 0, 1);
+            o[j + 2] = Math.Clamp(a2, 0, 1);
+        }
+    });
+    return output;
+}
+@ The Swift code accumulated the three channels in tuples; C\# uses three named locals, which the
+JIT keeps in registers just as well.
+
+<<Win Filters: Sobel gradient magnitude>>=
+/// <summary>Per-channel Sobel gradient magnitude.</summary>
+internal static PixelBuffer Sobel(PixelBuffer src)
+{
+    float[] gx = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+    float[] gy = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+    var output = src.Clone();
+    int w = src.Width, h = src.Height;
+    var s = src.Data;
+    var o = output.Data;
+    Parallel.For(0, h, y =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            float sx0 = 0, sx1 = 0, sx2 = 0, sy0 = 0, sy1 = 0, sy2 = 0;
+            for (int ky = -1; ky <= 1; ky++)
+            {
+                int yy = Math.Clamp(y + ky, 0, h - 1);
+                for (int kx = -1; kx <= 1; kx++)
+                {
+                    int xx = Math.Clamp(x + kx, 0, w - 1);
+                    int ki = (ky + 1) * 3 + (kx + 1);
+                    int i = (yy * w + xx) * 4;
+                    sx0 += s[i] * gx[ki]; sy0 += s[i] * gy[ki];
+                    sx1 += s[i + 1] * gx[ki]; sy1 += s[i + 1] * gy[ki];
+                    sx2 += s[i + 2] * gx[ki]; sy2 += s[i + 2] * gy[ki];
+                }
+            }
+            int j = (y * w + x) * 4;
+            o[j] = MathF.Min(MathF.Sqrt(sx0 * sx0 + sy0 * sy0), 1);
+            o[j + 1] = MathF.Min(MathF.Sqrt(sx1 * sx1 + sy1 * sy1), 1);
+            o[j + 2] = MathF.Min(MathF.Sqrt(sx2 * sx2 + sy2 * sy2), 1);
+        }
+    });
+    return output;
+}
+@
+
+\section{Operations and number formatting}\label{sec:win-operations}
+
+[[ImageOperation]] unifies filters and resampling exactly as in Section~\ref{sec:operations}, and
+it is built with the same record idiom as [[FilterKind]].
+
+<<Windows/LineScope.Core/ImageOperation.cs>>=
+namespace LineScope.Core;
+
+/// <summary>One step that derives a new image from an existing one.</summary>
+public abstract record ImageOperation
+{
+    public sealed record Filter(FilterKind Kind) : ImageOperation;
+    public sealed record Resample(ResampleMethod Method, double Scale) : ImageOperation;
+
+    <<Win ImageOperation: display name>>
+
+    <<Win ImageOperation: applying the step>>
+}
+@
+<<Win ImageOperation: display name>>=
+public string DisplayName => this switch
+{
+    Filter f => f.Kind.DisplayName,
+    Resample r => $"{r.Method.ShortName()} ×{Fmt.Number(r.Scale)}",
+    _ => "",
+};
+@ Applying an operation is still a pure function from buffer to buffer. Since buffers are treated
+as values (Section~\ref{sec:win-pixels}), the result can be computed on a worker thread while the
+views keep drawing the input.
+
+<<Win ImageOperation: applying the step>>=
+public PixelBuffer Apply(PixelBuffer buffer) => this switch
+{
+    Filter f => Filters.Apply(f.Kind, buffer),
+    Resample r => Resampler.Resample(buffer, r.Scale, r.Method),
+    _ => buffer,
+};
+@ \subsection{Formatting numbers}\label{sec:win-formatting}
+
+The Swift helper [[fmt]] lives in [[Filters.swift]] and uses [[FormatStyle]], which formats for
+the user's locale. The port gives formatting its own small class, [[Fmt]], used by the core's
+names and by the app's labels alike.
+
+<<Windows/LineScope.Core/Formatting.cs>>=
+using System.Globalization;
+
+namespace LineScope.Core;
+
+public static class Fmt
+{
+    <<Win Fmt: at most a few decimals>>
+
+    <<Win Fmt: a fixed number of decimals>>
+}
+@ [[Number]] reproduces [[.precision(.fractionLength(0...3))]] with a custom format string. In
+[[#,0.###]], the comma asks for digit grouping, [[0]] forces at least one integer digit, and each
+[[#]] after the point is an optional decimal, so trailing zeros vanish: $2$ becomes ``2'' and
+$0.125$ becomes ``0.125''. With no decimals allowed the format is just [[#,0]].
+
+The culture is passed explicitly. [[CultureInfo.CurrentCulture]] follows the regional settings of
+Windows, so with a Spanish locale a tab reads ``Gaussian r=0,5'' and a large size ``1.024'', as
+the same user would expect from any other program; macOS's formatter behaves the same way. Passing
+the culture, instead of relying on the implicit default, also documents that the choice is
+intended: the parameter dialog parses what the user types with the same culture (and accepts a
+period as well), so what is displayed can be typed back. How the last digit is rounded is left to
+each platform's formatter.
+
+<<Win Fmt: at most a few decimals>>=
+/// <summary>Locale-aware number with grouping and at most <paramref name="maxFraction"/> decimals.</summary>
+public static string Number(double v, int maxFraction = 3) =>
+    v.ToString(maxFraction > 0 ? "#,0." + new string('#', maxFraction) : "#,0", CultureInfo.CurrentCulture);
+@ The standard format [[N]] with a digit count gives grouping and exactly that many decimals, for
+readouts that always show the same number of decimals.
+
+<<Win Fmt: a fixed number of decimals>>=
+/// <summary>Locale-aware number with exactly <paramref name="digits"/> decimals.</summary>
+public static string Fixed(double v, int digits) =>
+    v.ToString("N" + digits, CultureInfo.CurrentCulture);
+@
+
+\section{Lines and colors}\label{sec:win-lines}
+
+The line sampler and the color conversions are the measuring instruments of LineScope, and they
+are ported without any change of algorithm (Chapter~\ref{ch:analysis}). The Swift structs become
+record structs, which again bring value equality for free.
+
+<<Windows/LineScope.Core/LineSampler.cs>>=
+namespace LineScope.Core;
+
+<<Win LineSampler: normalized point>>
+
+<<Win LineSampler: line segment>>
+
+<<Win LineSampler: sample record>>
+
+<<Win LineSampler: sampler>>
+@
+<<Win LineSampler: normalized point>>=
+/// <summary>A point relative to the image extent: (0,0) is the top-left corner, (1,1) the bottom-right corner.</summary>
+public readonly record struct NormalizedPoint(double X, double Y)
+{
+    public NormalizedPoint Clamped() => new(Math.Clamp(X, 0, 1), Math.Clamp(Y, 0, 1));
+}
+@ The Swift point and segment had mutable fields; these are [[readonly]]: moving an end point makes a new
+value, typically with a [[with]] expression, instead of assigning to a field.
+
+<<Win LineSampler: line segment>>=
+/// <summary>The selection line, in normalized coordinates so it lands on the same content in every resampled copy.</summary>
+public readonly record struct LineSegment(NormalizedPoint Start, NormalizedPoint End)
+{
+    /// <summary>Full-width horizontal line at mid-height.</summary>
+    public static readonly LineSegment Initial = new(new NormalizedPoint(0, 0.5), new NormalizedPoint(1, 0.5));
+
+    public double PixelLength(int width, int height)
+    {
+        double dx = (End.X - Start.X) * width;
+        double dy = (End.Y - Start.Y) * height;
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+}
+@ The sample record holds arrays and is a class (a plain [[record]]), since it is produced once per
+redraw and only read afterwards. Its field comments move into [[param]] tags.
+
+<<Win LineSampler: sample record>>=
+/// <param name="Positions">Position along the line, 0 at Start and 1 at End.</param>
+/// <param name="Colors">Sampled colors.</param>
+/// <param name="PixelLength">Line length in the sampled image's pixels.</param>
+/// <param name="Spacing">Distance between consecutive samples, in pixels (≈ 1).</param>
+public sealed record LineSamples(double[] Positions, Rgba[] Colors, double PixelLength, double Spacing);
+@
+<<Win LineSampler: sampler>>=
+public static class LineSampler
+{
+    <<Win LineSampler: sample along the line>>
+
+    <<Win LineSampler: bilinear interpolation>>
+}
+@ The count of samples is $\max(2, \lceil L\rceil + 1)$ as before, with [[Math.Ceiling]] for
+[[rounded(.up)]].
+
+<<Win LineSampler: sample along the line>>=
+/// <summary>
+/// Samples the line in the buffer's own pixel grid: <c>ceil(length) + 1</c> bilinear samples,
+/// so a half-size copy yields about half as many samples.
+/// </summary>
+public static LineSamples Sample(PixelBuffer buffer, LineSegment line)
+{
+    double w = buffer.Width, h = buffer.Height;
+    double length = line.PixelLength(buffer.Width, buffer.Height);
+    int count = Math.Max(2, (int)Math.Ceiling(length) + 1);
+    double x0 = line.Start.X * w, y0 = line.Start.Y * h;
+    double x1 = line.End.X * w, y1 = line.End.Y * h;
+
+    var positions = new double[count];
+    var colors = new Rgba[count];
+    for (int i = 0; i < count; i++)
+    {
+        double t = (double)i / (count - 1);
+        positions[i] = t;
+        colors[i] = Bilinear(buffer, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+    }
+    return new LineSamples(positions, colors, length, length / (count - 1));
+}
+@ The bilinear interpolation keeps Swift's nested function [[mix]] as a C\# local function, which
+captures the four indices and the two fractions in the same way. The fractions are converted to
+[[float]] before mixing, as in Swift, so the interpolated values agree bit for bit.
+
+<<Win LineSampler: bilinear interpolation>>=
+/// <summary>Bilinear interpolation at a continuous position (pixel centers at +0.5), edges clamped.</summary>
+public static Rgba Bilinear(PixelBuffer buffer, double x, double y)
+{
+    double fx = x - 0.5;
+    double fy = y - 0.5;
+    int ix = (int)Math.Floor(fx);
+    int iy = (int)Math.Floor(fy);
+    float tx = (float)(fx - ix);
+    float ty = (float)(fy - iy);
+    int x0 = Math.Clamp(ix, 0, buffer.Width - 1);
+    int x1 = Math.Clamp(ix + 1, 0, buffer.Width - 1);
+    int y0 = Math.Clamp(iy, 0, buffer.Height - 1);
+    int y1 = Math.Clamp(iy + 1, 0, buffer.Height - 1);
+
+    var d = buffer.Data;
+    int w = buffer.Width;
+    float Mix(int c)
+    {
+        float a = d[(y0 * w + x0) * 4 + c];
+        float b = d[(y0 * w + x1) * 4 + c];
+        float e = d[(y1 * w + x0) * 4 + c];
+        float f = d[(y1 * w + x1) * 4 + c];
+        float top = a + (b - a) * tx;
+        float bottom = e + (f - e) * tx;
+        return top + (bottom - top) * ty;
+    }
+    return new Rgba(Mix(0), Mix(1), Mix(2), Mix(3));
+}
+@ \subsection{Color models}
+
+The color models follow the pattern of [[ResampleMethod]]: a bare enumeration, and a companion
+class of extension methods for the channel names and plot ranges. A value tuple
+[[(Min, Max)]] stands in for Swift's [[ClosedRange]].
+
+<<Windows/LineScope.Core/ColorSpaces.cs>>=
+namespace LineScope.Core;
+
+public enum ColorModel { Rgba, Hsl, Cmyk }
+
+<<Win ColorSpaces: names, channels and plot ranges>>
+
+public static class ColorConversion
+{
+    <<Win ColorSpaces: HSL>>
+
+    <<Win ColorSpaces: CMYK>>
+
+    <<Win ColorSpaces: channel extraction>>
+}
+@
+<<Win ColorSpaces: names, channels and plot ranges>>=
+public static class ColorModelInfo
+{
+    public static readonly ColorModel[] All = [ColorModel.Rgba, ColorModel.Hsl, ColorModel.Cmyk];
+
+    public static string DisplayName(this ColorModel m) => m switch
+    {
+        ColorModel.Rgba => "RGBA",
+        ColorModel.Hsl => "HSL",
+        _ => "CMYK",
+    };
+
+    public static string[] Channels(this ColorModel m) => m switch
+    {
+        ColorModel.Rgba => ["Red", "Green", "Blue", "Alpha"],
+        ColorModel.Hsl => ["Hue", "Saturation", "Lightness"],
+        _ => ["Cyan", "Magenta", "Yellow", "Black"],
+    };
+
+    /// <summary>Plot range for a channel; hue is in degrees, everything else in 0…1.</summary>
+    public static (double Min, double Max) RangeOfChannel(this ColorModel m, int channel) =>
+        m == ColorModel.Hsl && channel == 0 ? (0, 360) : (0, 1);
+}
+@ The HSL formulas are those of Chapter~\ref{ch:analysis}, and three details keep them exactly
+equal. The C\# remainder operator [[%]] on floats truncates like Swift's
+[[truncatingRemainder(dividingBy:)]], keeping the sign of the dividend, so the correction of a
+negative hue is still needed and still sufficient. The gray test is written
+[[!(d > 1e-7f)]] to behave like Swift's [[guard]] for every input, NaN included. And the sextant
+switch uses relational patterns, [[< 1 =>]], which are tried in order exactly like Swift's
+[[case ..<1:]].
+
+<<Win ColorSpaces: HSL>>=
+// HSL (hue in degrees)
+
+public static (float H, float S, float L) Hsl(Rgba c)
+{
+    float maxV = Math.Max(c.R, Math.Max(c.G, c.B));
+    float minV = Math.Min(c.R, Math.Min(c.G, c.B));
+    float l = (maxV + minV) / 2;
+    float d = maxV - minV;
+    if (!(d > 1e-7f)) return (0, 0, l);
+    float s = d / (1 - MathF.Abs(2 * l - 1));
+    float h;
+    if (maxV == c.R) h = ((c.G - c.B) / d) % 6;
+    else if (maxV == c.G) h = (c.B - c.R) / d + 2;
+    else h = (c.R - c.G) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+    return (h, Math.Clamp(s, 0, 1), l);
+}
+
+public static Rgba FromHsl(float h, float s, float l, float alpha = 1)
+{
+    float c = (1 - MathF.Abs(2 * l - 1)) * s;
+    float hp = h / 60;
+    float x = c * (1 - MathF.Abs(hp % 2 - 1));
+    (float r, float g, float b) = hp switch
+    {
+        < 1 => (c, x, 0f),
+        < 2 => (x, c, 0f),
+        < 3 => (0f, c, x),
+        < 4 => (0f, x, c),
+        < 5 => (x, 0f, c),
+        _ => (c, 0f, x),
+    };
+    float m = l - c / 2;
+    return new Rgba(r + m, g + m, b + m, alpha);
+}
+@ The Swift inverses were both called [[rgb]] and told apart by their argument labels. C\#
+overloads can't be distinguished by parameter names alone, and both take four floats, so the
+inverses are named [[FromHsl]] and [[FromCmyk]].
+
+<<Win ColorSpaces: CMYK>>=
+// CMYK (naive device-independent conversion, K = 1 - max(R,G,B))
+
+public static (float C, float M, float Y, float K) Cmyk(Rgba c)
+{
+    float k = 1 - Math.Max(c.R, Math.Max(c.G, c.B));
+    if (!(k < 1 - 1e-7f)) return (0, 0, 0, 1);
+    float d = 1 - k;
+    return ((1 - c.R - k) / d, (1 - c.G - k) / d, (1 - c.B - k) / d, k);
+}
+
+public static Rgba FromCmyk(float c, float m, float y, float k, float alpha = 1) =>
+    new((1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k), alpha);
+@ Swift picked the channel by indexing a temporary array. The port uses switch expressions, which
+allocate nothing; this function runs once per sample for every redraw of a profile.
+
+<<Win ColorSpaces: channel extraction>>=
+// Channel extraction
+
+public static float Value(Rgba color, ColorModel model, int channel)
+{
+    switch (model)
+    {
+        case ColorModel.Rgba:
+            return channel switch { 0 => color.R, 1 => color.G, 2 => color.B, _ => color.A };
+        case ColorModel.Hsl:
+            var v = Hsl(color);
+            return channel switch { 0 => v.H, 1 => v.S, _ => v.L };
+        default:
+            var k = Cmyk(color);
+            return channel switch { 0 => k.C, 1 => k.M, 2 => k.Y, _ => k.K };
+    }
+}
+@
+
+\section{The spectrum}\label{sec:win-spectrum}
+
+The spectrum keeps everything of Chapter~\ref{ch:analysis} that defines the numbers on the
+screen: the zero padding to a power of two, the optional mean removal, the symmetric Hann window,
+the single-sided amplitudes divided by the window sum, and the two frequency axes. What changes is
+the transform underneath. vDSP isn't available, and rather than take a dependency for one
+function, the port carries its own FFT.
+
+<<Windows/LineScope.Core/Spectrum.cs>>=
+using System.Numerics;
+
+namespace LineScope.Core;
+
+<<Win Spectrum: window functions>>
+
+<<Win Spectrum: result>>
+
+<<Win Spectrum: analyzer>>
+
+<<Win Spectrum: the radix-2 FFT>>
+@
+<<Win Spectrum: window functions>>=
+public enum WindowFunction { None, Hann }
+
+public static class WindowFunctionInfo
+{
+    public static readonly WindowFunction[] All = [WindowFunction.None, WindowFunction.Hann];
+
+    public static string DisplayName(this WindowFunction w) => w == WindowFunction.None ? "Rectangular" : "Hann";
+}
+@ The peak search is written as a loop that replaces the best bin only when a later one is strictly
+larger. That is how Swift's [[max(by:)]] resolves ties, so both versions report the \emph{first}
+of several equal peaks.
+
+<<Win Spectrum: result>>=
+/// <param name="CyclesPerPixel">Bin frequencies in cycles per pixel of the sampled image (Nyquist ≈ 0.5).</param>
+/// <param name="CyclesPerLine">Bin frequencies in cycles over the whole line; comparable across resampled copies.</param>
+/// <param name="Amplitudes">Single-sided amplitude: a sine of amplitude A peaks at ≈ A.</param>
+public sealed record SpectrumResult(
+    double[] CyclesPerPixel, double[] CyclesPerLine, double[] Amplitudes, int FftSize, int SampleCount)
+{
+    public static readonly SpectrumResult Empty = new([], [], [], 0, 0);
+
+    /// <summary>Index of the largest non-DC bin.</summary>
+    public int? PeakIndex
+    {
+        get
+        {
+            if (Amplitudes.Length <= 1) return null;
+            int best = 1;
+            for (int i = 2; i < Amplitudes.Length; i++)
+                if (Amplitudes[best] < Amplitudes[i]) best = i;
+            return best;
+        }
+    }
+}
+@ The analyzer has the five steps of the Swift version; the zero padding is now folded into the
+transform step.
+
+<<Win Spectrum: analyzer>>=
+public static class SpectrumAnalyzer
+{
+    /// <summary>Real FFT of a profile, zero-padded to the next power of two.</summary>
+    /// <param name="spacing">Distance between samples, in pixels.</param>
+    public static SpectrumResult Compute(float[] values, double spacing, WindowFunction window, bool removeMean)
+    {
+        <<Win Spectrum: choose the FFT size>>
+
+        <<Win Spectrum: condition the signal>>
+
+        <<Win Spectrum: complex FFT of the padded signal>>
+
+        <<Win Spectrum: single-sided amplitudes>>
+
+        <<Win Spectrum: frequency axes>>
+    }
+}
+@
+<<Win Spectrum: choose the FFT size>>=
+int n = values.Length;
+if (n < 2) return SpectrumResult.Empty;
+int log2n = (int)Math.Ceiling(Math.Log2(n));
+int fftSize = 1 << log2n;
+int half = fftSize / 2;
+@ Mean removal and windowing are written as loops where Swift called [[vDSP.mean]],
+[[vDSP.add]], [[vDSP.multiply]] and [[vDSP.sum]]. The formulas are the same, but a sum computed
+in a different order (vDSP's is vectorized, LINQ's [[Sum]] accumulates in [[double]]) can differ
+in its last bits. This is the one place where a profile's spectrum may differ from macOS at all,
+and only at the level of float rounding.
+
+<<Win Spectrum: condition the signal>>=
+var signal = (float[])values.Clone();
+if (removeMean)
+{
+    float mean = signal.Sum() / n;
+    for (int i = 0; i < n; i++) signal[i] -= mean;
+}
+float windowSum = n;
+if (window == WindowFunction.Hann)
+{
+    // Symmetric Hann over the n real samples.
+    windowSum = 0;
+    for (int i = 0; i < n; i++)
+    {
+        float w = 0.5f - 0.5f * MathF.Cos(2 * MathF.PI * i / (n - 1));
+        signal[i] *= w;
+        windowSum += w;
+    }
+}
+@ The conditioned samples become the real parts of a complex array of length $N$; the rest of the
+array, and every imaginary part, is zero. That is the zero padding, and it happens by itself,
+because a new array of [[Complex]] is zero-initialized.
+
+Swift's version used vDSP's \emph{packed real} FFT, which transforms the $N$ real samples as
+$N/2$ complex numbers and unpacks the result. The port transforms the full complex array instead.
+This does about twice the arithmetic, since half of the input is known to be zero, but a profile
+has at most a few thousand samples and the transform takes microseconds; the simpler code wins.
+[[Complex]] is also double precision, where vDSP worked in [[float]], so the port's transform is
+if anything slightly more accurate.
+
+<<Win Spectrum: complex FFT of the padded signal>>=
+var buffer = new Complex[fftSize];
+for (int i = 0; i < n; i++) buffer[i] = signal[i];
+Fft.Forward(buffer);
+@ Here the two normalizations meet. vDSP's packed output held $2X_k$ for $0 < k < N/2$, and
+squeezed the two real bins into one slot, $2X_0$ in the real part and $2X_{N/2}$ in the imaginary
+part of element 0; the Swift code therefore unpacked element 0 and divided everything by 2.
+The complex FFT returns the plain, unscaled $X_k = \sum_j x_j e^{-2\pi i jk/N}$, with $X_0$ at
+index 0 and $X_{N/2}$ at index $N/2$, each in its own place. Both the unpacking and the halving
+disappear, and what remains is literally the formula of Chapter~\ref{ch:analysis}:
+\[
+  A_0 = \frac{|X_0|}{\sum_i w_i},\qquad
+  A_k = \frac{2\,|X_k|}{\sum_i w_i}\quad(0<k<N/2),\qquad
+  A_{N/2} = \frac{|X_{N/2}|}{\sum_i w_i}.
+\]
+The bins above $N/2$ are the complex conjugates of those below, because the input is real, and
+are ignored.
+
+<<Win Spectrum: single-sided amplitudes>>=
+var amplitudes = new double[half + 1];
+double norm = Math.Max(windowSum, 1e-12);
+amplitudes[0] = buffer[0].Magnitude / norm;
+amplitudes[half] = buffer[half].Magnitude / norm;
+for (int k = 1; k < Math.Max(half, 1); k++)
+    amplitudes[k] = 2 * buffer[k].Magnitude / norm;
+@
+<<Win Spectrum: frequency axes>>=
+double lineLength = spacing * (n - 1);
+var cpp = new double[half + 1];
+var cpl = new double[half + 1];
+for (int k = 0; k <= half; k++)
+{
+    cpp[k] = k / (fftSize * spacing);
+    cpl[k] = cpp[k] * lineLength;
+}
+return new SpectrumResult(cpp, cpl, amplitudes, fftSize, n);
+@ \subsection{The FFT}\label{sec:win-fft}
+
+The transform is the iterative radix-2 algorithm of Cooley and Tukey~\cite{cooley65}, in its
+decimation-in-time form. Its idea is to split a DFT of length $N$ into the DFTs of the
+even-indexed and the odd-indexed samples, $E_k$ and $O_k$, each of length $N/2$:
+\[
+  X_k = E_k + W_N^k\,O_k,\qquad X_{k+N/2} = E_k - W_N^k\,O_k,\qquad
+  W_N = e^{-2\pi i/N},\quad 0 \le k < N/2 .
+\]
+Applied recursively down to length 1, this costs $O(N\log N)$ operations instead of the $O(N^2)$
+of the definition. The iterative version runs the recursion bottom up and in place: first it
+reorders the input so that every sub-transform finds its samples next to each other, then it
+combines neighbors into transforms of length 2, 4, 8, \dots, $N$.
+
+<<Win Spectrum: the radix-2 FFT>>=
+/// <summary>In-place iterative radix-2 Cooley-Tukey FFT (replaces vDSP on macOS).</summary>
+internal static class Fft
+{
+    /// <summary>Forward DFT, X[k] = Σ x[j]·e^(−2πi·jk/N), unscaled. The length must be a power of two.</summary>
+    public static void Forward(Complex[] a)
+    {
+        int n = a.Length;
+        if (n <= 1) return;
+        if ((n & (n - 1)) != 0) throw new ArgumentException("FFT length must be a power of two.");
+
+        <<Win Fft: bit-reversal permutation>>
+
+        <<Win Fft: butterflies>>
+    }
+}
+@ Splitting into even and odd samples at every level means that, after all the splits, sample $j$
+ends up at the position whose binary digits are those of $j$ reversed. For $N = 8$, sample
+$1 = 001_2$ goes to position $100_2 = 4$, and sample $3 = 011_2$ to $110_2 = 6$. The loop walks
+$i = 1, \dots, N-1$ while keeping $j$ equal to the bit reversal of $i$. Incrementing a reversed
+number means adding 1 at its \emph{top} bit and carrying downward: clear the leading ones until
+the first zero, then set that zero. The inner [[for]] clears the ones, and the [[j ^= bit]] after
+it sets the zero. Each pair is swapped once, when $i < j$; positions with $i = j$ stay put.
+
+<<Win Fft: bit-reversal permutation>>=
+// Bit-reversal permutation.
+for (int i = 1, j = 0; i < n; i++)
+{
+    int bit = n >> 1;
+    for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) (a[i], a[j]) = (a[j], a[i]);
+}
+@ Each stage combines pairs of transforms of length $\mathit{len}/2$, lying next to each other,
+into one transform of length $\mathit{len}$, by the \emph{butterfly} above: $u$ is $E_k$, $v$ is
+$W^k O_k$, and they are replaced by $u+v$ and $u-v$. The twiddle factor $w = W_{\mathit{len}}^k$
+starts at 1 for every block and is advanced by one multiplication with
+$W_{\mathit{len}} = e^{-2\pi i/\mathit{len}}$ per step, instead of calling [[Math.Cos]] and
+[[Math.Sin]] for every $k$. The recurrence accumulates rounding error proportional to the block
+length, which in double precision stays far below the float precision of the input for any
+length LineScope uses.
+
+The output is unscaled, as the documentation comment states, and that is what the amplitude
+normalization above assumes. The tests check the transform against a direct evaluation of the
+DFT's definition.
+
+<<Win Fft: butterflies>>=
+for (int len = 2; len <= n; len <<= 1)
+{
+    double angle = -2 * Math.PI / len;
+    var wLen = new Complex(Math.Cos(angle), Math.Sin(angle));
+    int halfLen = len >> 1;
+    for (int i = 0; i < n; i += len)
+    {
+        Complex w = Complex.One;
+        for (int k = 0; k < halfLen; k++)
+        {
+            Complex u = a[i + k];
+            Complex v = a[i + k + halfLen] * w;
+            a[i + k] = u + v;
+            a[i + k + halfLen] = u - v;
+            w *= wLen;
+        }
+    }
+}
+@
+
+\section{Test patterns}\label{sec:win-patterns}
+
+The test patterns are ported formula for formula from Chapter~\ref{ch:patterns}, and the same
+specification produces the same image on both systems, noise included. The file has the same
+parts as the Swift one, plus a record for the pattern parameter.
+
+<<Windows/LineScope.Core/TestPattern.cs>>=
+namespace LineScope.Core;
+
+<<Win TestPattern: pattern kinds>>
+
+<<Win TestPattern: the parameter record>>
+
+<<Win TestPattern: names, purposes and parameters>>
+
+<<Win TestPattern: specification>>
+
+<<Win TestPattern: generator>>
+
+<<Win TestPattern: SplitMix64>>
+@
+<<Win TestPattern: pattern kinds>>=
+/// <summary>Synthetic images commonly used to evaluate resampling and filtering.</summary>
+public enum TestPatternKind
+{
+    ZonePlate,
+    LinearChirp,
+    SineGrating,
+    SquareGrating,
+    Checkerboard,
+    StepEdge,
+    SlantedEdge,
+    Impulses,
+    SiemensStar,
+    WhiteNoise,
+    HueRamp,
+}
+@ Swift described a parameter with a named tuple whose range was a [[ClosedRange]]. The port gives
+it a small record with a [[Clamp]] method, which is what the range was used for.
+
+<<Win TestPattern: the parameter record>>=
+/// <summary>The single tunable parameter of a pattern.</summary>
+public sealed record PatternParameter(string Name, double DefaultValue, double Min, double Max)
+{
+    public double Clamp(double v) => Math.Clamp(v, Min, Max);
+}
+@ The names, the one-sentence purposes and the parameters are the Swift tables, as extension
+methods.
+
+<<Win TestPattern: names, purposes and parameters>>=
+public static class TestPatternKindInfo
+{
+    public static readonly TestPatternKind[] All = Enum.GetValues<TestPatternKind>();
+
+    <<Win TestPattern: display names>>
+
+    <<Win TestPattern: what each pattern is for>>
+
+    <<Win TestPattern: the tunable parameter>>
+}
+@
+<<Win TestPattern: display names>>=
+public static string DisplayName(this TestPatternKind k) => k switch
+{
+    TestPatternKind.ZonePlate => "Zone Plate",
+    TestPatternKind.LinearChirp => "Linear Chirp",
+    TestPatternKind.SineGrating => "Sine Grating",
+    TestPatternKind.SquareGrating => "Square-Wave Bars",
+    TestPatternKind.Checkerboard => "Checkerboard",
+    TestPatternKind.StepEdge => "Step Edge",
+    TestPatternKind.SlantedEdge => "Slanted Edge",
+    TestPatternKind.Impulses => "Impulse Grid",
+    TestPatternKind.SiemensStar => "Siemens Star",
+    TestPatternKind.WhiteNoise => "White Noise",
+    _ => "Hue / Lightness Ramp",
+};
+@
+<<Win TestPattern: what each pattern is for>>=
+/// <summary>What the pattern is good for, shown in the generator window.</summary>
+public static string Purpose(this TestPatternKind k) => k switch
+{
+    TestPatternKind.ZonePlate => "Circular chirp: frequency grows with radius up to the chosen maximum. Aliasing appears as false ring centers.",
+    TestPatternKind.LinearChirp => "Horizontal sweep from 0 to the chosen frequency. Put the line across it to read a filter's frequency response.",
+    TestPatternKind.SineGrating => "Single pure frequency along x. The spectrum should show one peak.",
+    TestPatternKind.SquareGrating => "Bars with odd harmonics. Shows how filters treat harmonics near Nyquist.",
+    TestPatternKind.Checkerboard => "Two-dimensional square wave. Small cells alias badly under nearest-neighbor.",
+    TestPatternKind.StepEdge => "One hard vertical edge. Reveals ringing (sinc, Lanczos) versus blur (tent, Mitchell).",
+    TestPatternKind.SlantedEdge => "Edge tilted a few degrees, the standard target for measuring sharpness (MTF).",
+    TestPatternKind.Impulses => "Isolated single pixels. Each dot shows the filter's point-spread function.",
+    TestPatternKind.SiemensStar => "Radial spokes: spatial frequency rises toward the center, in every orientation.",
+    TestPatternKind.WhiteNoise => "Uniform random values with a flat spectrum. The profile's spectrum shows the filter's transfer curve.",
+    _ => "Hue across x, lightness down y. Use it with the HSL and CMYK channels.",
+};
+@
+<<Win TestPattern: the tunable parameter>>=
+/// <summary>The single tunable parameter, or null if the pattern has none.</summary>
+public static PatternParameter? Parameter(this TestPatternKind k) => k switch
+{
+    TestPatternKind.ZonePlate or TestPatternKind.LinearChirp => new("Max frequency (cycles/px)", 0.5, 0.01, 1),
+    TestPatternKind.SineGrating => new("Frequency (cycles/px)", 0.1, 0.001, 1),
+    TestPatternKind.SquareGrating => new("Period (px)", 8, 2, 512),
+    TestPatternKind.Checkerboard => new("Cell size (px)", 8, 1, 512),
+    TestPatternKind.SlantedEdge => new("Angle (degrees)", 5, -45, 45),
+    TestPatternKind.Impulses => new("Spacing (px)", 32, 2, 1024),
+    TestPatternKind.SiemensStar => new("Spokes", 36, 4, 360),
+    TestPatternKind.WhiteNoise => new("Seed", 1, 0, 1_000_000),
+    _ => null,
+};
+@ The specification is a [[readonly record struct]], so it compares and hashes by value, as the
+Swift [[Hashable]] struct did. Its positional constructor takes all four
+values. A second constructor supplies the defaults and a nullable parameter, which becomes the
+kind's default, like Swift's [[parameter: Double? = nil]]; a call with a [[double]] for the last
+argument picks the positional constructor, one without it the second. [[Clamped]] is new in the
+port; it forces the parameter into its range with [[with]], which copies a record and changes one
+field.
+
+<<Win TestPattern: specification>>=
+public readonly record struct TestPatternSpec(TestPatternKind Kind, int Width, int Height, double Parameter)
+{
+    public TestPatternSpec(TestPatternKind kind, int width = 512, int height = 512, double? parameter = null)
+        : this(kind, width, height, parameter ?? kind.Parameter()?.DefaultValue ?? 0) { }
+
+    public string Title
+    {
+        get
+        {
+            var t = $"{Kind.DisplayName()} {Width}×{Height}";
+            var p = Kind.Parameter();
+            if (p is not null && (Kind != TestPatternKind.WhiteNoise || Parameter != p.DefaultValue))
+                t += $" ({Fmt.Number(Parameter)})";
+            return t;
+        }
+    }
+
+    /// <summary>The spec with its parameter clamped to the kind's range.</summary>
+    public TestPatternSpec Clamped()
+    {
+        var p = Kind.Parameter();
+        return p is null ? this : this with { Parameter = p.Clamp(Parameter) };
+    }
+}
+@ \subsection{The generator}
+
+The generator has the Swift structure: set up the canvas, define the gray-level helper, switch on
+the kind. The helper [[RoundInt]] at the end of the class is the port's spelling of Swift's
+[[Int(p.rounded())]]. Without [[MidpointRounding.AwayFromZero]], a checkerboard with cells of
+$2.5$ pixels would get cells of 2 on Windows and 3 on macOS.
+
+<<Win TestPattern: generator>>=
+public static class TestPatternGenerator
+{
+    public static PixelBuffer Make(TestPatternSpec spec)
+    {
+        <<Win TestPattern: set up the canvas>>
+
+        <<Win TestPattern: gray-level helper>>
+
+        switch (spec.Kind)
+        {
+            <<Win TestPattern: chirps and gratings>>
+            <<Win TestPattern: edges and impulses>>
+            <<Win TestPattern: Siemens star>>
+            <<Win TestPattern: noise and color ramp>>
+        }
+        return buf;
+    }
+
+    private static int RoundInt(double v) => (int)Math.Round(v, MidpointRounding.AwayFromZero);
+}
+@ Writing [[w / 2.0]] instead of [[w / 2]] matters in C\#: with two integers the division would
+truncate, and the center of an odd-sized image would move by half a pixel.
+
+<<Win TestPattern: set up the canvas>>=
+int w = Math.Max(1, spec.Width);
+int h = Math.Max(1, spec.Height);
+double p = spec.Parameter;
+var buf = new PixelBuffer(w, h);
+double cx = w / 2.0;
+double cy = h / 2.0;
+@ The helper still evaluates $f$ at pixel centers, but over rows in parallel. That is safe because
+every pattern function is pure and each iteration writes only its own row.
+
+<<Win TestPattern: gray-level helper>>=
+void Gray(Func<double, double, double> f)
+{
+    Parallel.For(0, h, y =>
+    {
+        for (int x = 0; x < w; x++)
+        {
+            // Evaluate at pixel centers.
+            float v = (float)Math.Clamp(f(x + 0.5, y + 0.5), 0, 1);
+            buf[x, y] = new Rgba(v, v, v);
+        }
+    });
+}
+@ The cases are the Swift ones. Each case that declares locals gets braces, for the scoping reason
+given with the resampler. The square grating's [[%]] on doubles truncates exactly like
+[[truncatingRemainder]], and the casts [[(int)x]] truncate like Swift's [[Int(x)]].
+
+<<Win TestPattern: chirps and gratings>>=
+case TestPatternKind.ZonePlate:
+{
+    // Local frequency k·r reaches p at r = max(w,h)/2 (the left/right edges of the midline).
+    double k = p / (Math.Max(w, h) / 2.0);
+    Gray((x, y) =>
+    {
+        double r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+        return 0.5 + 0.5 * Math.Cos(Math.PI * k * r2);
+    });
+    break;
+}
+case TestPatternKind.LinearChirp:
+    // Phase 2π·p·x²/(2W): instantaneous frequency p·x/W.
+    Gray((x, _) => 0.5 + 0.5 * Math.Cos(Math.PI * p * x * x / w));
+    break;
+case TestPatternKind.SineGrating:
+    Gray((x, _) => 0.5 + 0.5 * Math.Sin(2 * Math.PI * p * x));
+    break;
+case TestPatternKind.SquareGrating:
+{
+    double period = Math.Max(p, 1);
+    Gray((x, _) => (x - 0.5) % period < period / 2 ? 1 : 0);
+    break;
+}
+case TestPatternKind.Checkerboard:
+{
+    int cell = Math.Max(RoundInt(p), 1);
+    Gray((x, y) => (((int)x / cell) + ((int)y / cell)) % 2 == 0 ? 1 : 0);
+    break;
+}
+@
+<<Win TestPattern: edges and impulses>>=
+case TestPatternKind.StepEdge:
+    Gray((x, _) => x < cx ? 0.1 : 0.9);
+    break;
+case TestPatternKind.SlantedEdge:
+{
+    // Dark/light halves split by a line through the center tilted from vertical.
+    double a = p * Math.PI / 180;
+    Gray((x, y) => ((x - cx) * Math.Cos(a) + (y - cy) * Math.Sin(a)) < 0 ? 0.1 : 0.9);
+    break;
+}
+case TestPatternKind.Impulses:
+{
+    int s = Math.Max(RoundInt(p), 1);
+    int off = s / 2;
+    Gray((x, y) => ((int)x % s == off && (int)y % s == off) ? 1 : 0);
+    break;
+}
+@ The Swift [[guard]] that keeps the star inside its circle becomes an early [[return]] with the
+test inverted.
+
+<<Win TestPattern: Siemens star>>=
+case TestPatternKind.SiemensStar:
+{
+    double spokes = Math.Max(Math.Round(p, MidpointRounding.AwayFromZero), 2);
+    double radius = Math.Min(w, h) / 2.0;
+    Gray((x, y) =>
+    {
+        double dx = x - cx, dy = y - cy;
+        if (dx * dx + dy * dy > radius * radius) return 0.5;
+        double theta = Math.Atan2(dy, dx);
+        return Math.Sin(spokes * theta) >= 0 ? 1 : 0;
+    });
+    break;
+}
+@ White noise is the one gray pattern that is \emph{not} generated in parallel. Its value at a
+pixel is the $k$-th output of the generator, where $k$ counts pixels in reading order, so the
+loops must run in that order to reproduce the Swift image from the same seed. The conversion to
+$[0,1)$ is the same: the top 53 bits divided by $2^{53}$, written [[1UL << 53]] so the shift is
+done on a 64-bit unsigned integer.
+
+<<Win TestPattern: noise and color ramp>>=
+case TestPatternKind.WhiteNoise:
+{
+    var rng = new SplitMix64((ulong)Math.Max(p, 0));
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            float v = (float)((rng.Next() >> 11) / (double)(1UL << 53));
+            buf[x, y] = new Rgba(v, v, v);
+        }
+    break;
+}
+case TestPatternKind.HueRamp:
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            float hue = (float)((x + 0.5) / w * 360);
+            float light = (float)(1 - (y + 0.5) / h);
+            var c = ColorConversion.FromHsl(Math.Min(hue, 359.999f), 1, light);
+            buf[x, y] = new Rgba(Math.Clamp(c.R, 0, 1), Math.Clamp(c.G, 0, 1), Math.Clamp(c.B, 0, 1));
+        }
+    break;
+@ \subsection{SplitMix64}
+
+The generator is SplitMix64 with the same constants. Swift needs the wrapping operators [[&+=]]
+and [[&*]], because its ordinary arithmetic traps on overflow. C\# arithmetic wraps by default,
+but a project can turn on overflow checking for the whole assembly, and then the multiplications
+would throw. The [[unchecked]] block states that wrapping modulo $2^{64}$ is the intended
+arithmetic, whatever the project settings.
+
+The struct uses a primary constructor to take the seed. It is mutable, and [[rng]] above is a
+local variable, so each call to [[Next]] advances the one generator rather than a copy.
+
+<<Win TestPattern: SplitMix64>>=
+/// <summary>Small deterministic generator so noise patterns are reproducible from their seed.</summary>
+internal struct SplitMix64(ulong seed)
+{
+    private ulong _state = seed;
+
+    public ulong Next()
+    {
+        unchecked
+        {
+            _state += 0x9E37_79B9_7F4A_7C15;
+            ulong z = _state;
+            z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9;
+            z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB;
+            return z ^ (z >> 31);
+        }
+    }
+}
+@

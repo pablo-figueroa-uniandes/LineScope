@@ -1,3 +1,5 @@
+\part{LineScope for macOS}
+
 \chapter{Pixels}\label{ch:pixels}
 
 Every numeric part of LineScope works on one image representation, the [[PixelBuffer]]. Choosing
