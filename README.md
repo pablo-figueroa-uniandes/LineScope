@@ -52,9 +52,9 @@ dotnet test LineScope.Core.Tests
 
 | Document | What it is |
 |---|---|
-| [**Theory and code**](Docs/LineScope-Theory-and-Code.md) ([PDF](Docs/LineScope-Theory-and-Code.pdf)) | Sampling and aliasing, resampling kernels and their frequency responses, filters, color models, the DFT and windowing, test patterns, architecture and experiments, all mapped to the code |
-| [**Literate program**](LiterateP/linescope.pdf) (PDF, 102 pages) | The whole code base as a Knuth-style literate program. `cd LiterateP && make check` confirms it tangles back to the sources byte for byte ([details](LiterateP/README.md)) |
-| [Session summary](Docs/Session-Summary.md) | How the project was built, the decisions made, and the known limitations |
+| [**Theory and code**](Docs/LineScope-Theory-and-Code.md) ([PDF](Docs/LineScope-Theory-and-Code.pdf)) | Sampling and aliasing, resampling kernels and their frequency responses, filters, color models, the DFT and windowing, test patterns, architecture, the Windows port and experiments, all mapped to the Swift and C# code |
+| [**Literate program**](LiterateP/linescope.pdf) (PDF, 233 pages) | The whole code base as a Knuth-style literate program: Part I is the macOS app, Part II the Windows port. `cd LiterateP && make check` confirms it tangles back to all 54 source files byte for byte ([details](LiterateP/README.md)) |
+| [Session summary](Docs/Session-Summary.md) | How the project was built, the decisions made, the known limitations, and an addendum on the Windows port |
 
 ## Layout
 
